@@ -225,7 +225,7 @@ step5:
     rl_proxy_eval_interval_steps: 1000
     rl_proxy_num_targets: 5
     rl_proxy_generation_budget: 64
-    trajectories_per_batch: 64
+    trajectories_per_batch: 48
     replay_batch_size: 16
     dpo:
       offline_pair_budget: 10000
@@ -347,11 +347,11 @@ step5_hpo:
   hpo_rl_num_steps: 32
   hpo_rl_proxy_eval_checks: 1
   hpo_sampling_batch_size: 64
-  hpo_decode_class_match_sampling_attempts_max: 12
-  hpo_decode_class_match_oversample_factor: 2.0
+  hpo_decode_class_match_sampling_attempts_max: 16
+  hpo_decode_class_match_oversample_factor: 3.0
   hpo_decode_class_match_max_request_size: 512
-  hpo_decode_class_match_max_total_raw_samples: 2048
-  hpo_decode_partial_quota_min_fill_ratio: 0.40
+  hpo_decode_class_match_max_total_raw_samples: 4096
+  hpo_decode_partial_quota_min_fill_ratio: 0.25
   hpo_s4_trajectories_per_batch: 8
   hpo_s4_rl_diffusion_num_steps: 8
   hpo_s4_replay_batch_size: 8

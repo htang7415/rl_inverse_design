@@ -293,12 +293,12 @@ chi_training:
     decode_constraint_class_match_sampling_attempts_max_overrides:
       polyamide: 24
       polyether: 24
-      polyimide: 32
+      polyimide: 48
       polysulfone: 24
     decode_constraint_class_match_oversample_factor: 3.0
     decode_constraint_class_match_oversample_factor_overrides:
       polyamide: 3.0
-      polyimide: 4.0
+      polyimide: 6.0
       polysulfone: 3.0
     decode_constraint_class_match_min_request_size: 1
     decode_constraint_class_match_min_request_size_overrides:
@@ -309,9 +309,11 @@ chi_training:
     decode_constraint_allow_partial_quota_return: true
     decode_constraint_allow_partial_quota_return_overrides:
       polyamide: true
+      polyimide: true
     decode_constraint_partial_quota_min_fill_ratio: 0.95
     decode_constraint_partial_quota_min_fill_ratio_overrides:
       polyamide: 0.95
+      polyimide: 0.60
     decode_constraint_enforce_star_ok_acceptance: false
     decode_constraint_enforce_star_ok_acceptance_overrides:
       polyacrylate: true
