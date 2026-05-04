@@ -17,7 +17,13 @@ import yaml
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from src.step5.config import _deep_merge, build_run_config, load_step5_config
+from src.step5.config import (
+    _deep_merge,
+    apply_step5_output_suffix,
+    apply_step5_target_condition_filter,
+    build_run_config,
+    load_step5_config,
+)
 from src.step5.dataset import build_step5_split_leakage_audit
 from src.step5.evaluation import load_step5_evaluator
 from src.step5.run_core import execute_step5_run
@@ -54,8 +60,11 @@ def _validate_positive_int(name: str, value: int | None) -> None:
         raise ValueError(f"{name} must be >= 1 when provided.")
 
 
-def _build_training_override(args) -> Dict[str, object]:
+def _build_step5_override(args) -> Dict[str, object]:
     override: Dict[str, object] = {}
+
+    if args.sampling_num_steps is not None:
+        override["sampling_num_steps"] = int(args.sampling_num_steps)
 
     s2_override: Dict[str, object] = {}
     if args.s2_max_steps is not None:
@@ -78,35 +87,71 @@ def _build_training_override(args) -> Dict[str, object]:
     return override
 
 
-def _apply_cli_resolved_overrides(resolved, *, training_override: Dict[str, object], method_root_suffix: str | None):
-    if not training_override and not method_root_suffix:
+def _build_base_config_override(args) -> Dict[str, object]:
+    override: Dict[str, object] = {}
+
+    if args.sampling_batch_size is not None:
+        override.setdefault("sampling", {})["batch_size"] = int(args.sampling_batch_size)
+
+    decode_override: Dict[str, object] = {}
+    if args.class_match_sampling_attempts_max is not None:
+        decode_override["decode_constraint_class_match_sampling_attempts_max"] = int(
+            args.class_match_sampling_attempts_max
+        )
+    if args.class_match_oversample_factor is not None:
+        decode_override["decode_constraint_class_match_oversample_factor"] = float(
+            args.class_match_oversample_factor
+        )
+    if args.class_match_max_request_size is not None:
+        decode_override["decode_constraint_class_match_max_request_size"] = int(
+            args.class_match_max_request_size
+        )
+    if args.class_match_max_total_raw_samples is not None:
+        decode_override["decode_constraint_class_match_max_total_raw_samples"] = int(
+            args.class_match_max_total_raw_samples
+        )
+    if args.partial_quota_min_fill_ratio is not None:
+        decode_override["decode_constraint_allow_partial_quota_return"] = True
+        decode_override["decode_constraint_partial_quota_min_fill_ratio"] = float(
+            args.partial_quota_min_fill_ratio
+        )
+
+    if decode_override:
+        override.setdefault("chi_training", {})["step5_inverse_design"] = decode_override
+
+    return override
+
+
+def _apply_cli_resolved_overrides(
+    resolved,
+    *,
+    step5_override: Dict[str, object],
+    base_config_override: Dict[str, object],
+    method_root_suffix: str | None,
+):
+    if not step5_override and not base_config_override and not method_root_suffix:
         return resolved
 
     step5_cfg = deepcopy(resolved.step5)
-    if training_override:
-        step5_cfg = _deep_merge(step5_cfg, training_override)
+    if step5_override:
+        step5_cfg = _deep_merge(step5_cfg, step5_override)
 
-    method_root = resolved.method_root
-    compare_root = resolved.compare_root
-    if method_root_suffix:
-        suffix = str(method_root_suffix)
-        method_root = method_root.parent / f"{method_root.name}{suffix}"
-        compare_root = compare_root.parent / f"{compare_root.name}{suffix}"
+    base_config = deepcopy(resolved.base_config)
+    if base_config_override:
+        base_config = _deep_merge(base_config, base_config_override)
 
     snapshot = deepcopy(resolved.config_snapshot)
     snapshot["step5"] = as_yamlable(step5_cfg)
-    if "paths" not in snapshot or not isinstance(snapshot["paths"], dict):
-        snapshot["paths"] = {}
-    snapshot["paths"]["method_root"] = str(method_root)
-    snapshot["paths"]["compare_root"] = str(compare_root)
+    if base_config_override:
+        snapshot["runtime_base_config_overrides"] = as_yamlable(base_config_override)
 
-    return replace(
+    updated = replace(
         resolved,
+        base_config=base_config,
         step5=step5_cfg,
-        method_root=method_root,
-        compare_root=compare_root,
         config_snapshot=snapshot,
     )
+    return apply_step5_output_suffix(updated, method_root_suffix=method_root_suffix)
 
 
 def _write_frame(df: pd.DataFrame, path: Path) -> None:
@@ -275,6 +320,18 @@ def main() -> None:
     parser.add_argument("--allow_partial", action="store_true", help="Skip unsupported runs for development.")
     parser.add_argument("--generation_budget", type=int, default=None, help="Override samples per target row.")
     parser.add_argument("--num_rounds", type=int, default=None, help="Override number of sampling rounds.")
+    parser.add_argument(
+        "--target_temperature",
+        type=float,
+        default=None,
+        help="Restrict Step 5 execution to this exact target temperature.",
+    )
+    parser.add_argument(
+        "--target_phi",
+        type=float,
+        default=None,
+        help="Restrict Step 5 execution to this exact target polymer fraction.",
+    )
     parser.add_argument("--s2_max_steps", type=int, default=None, help="Override Step 5 S2 supervised max_steps.")
     parser.add_argument(
         "--s2_val_check_interval_steps",
@@ -290,6 +347,38 @@ def main() -> None:
     )
     parser.add_argument("--rl_num_steps", type=int, default=None, help="Override Step 5 S4 RL rl_num_steps.")
     parser.add_argument("--dpo_num_epochs", type=int, default=None, help="Override Step 5 S4 DPO num_epochs.")
+    parser.add_argument("--sampling_batch_size", type=int, default=None, help="Override raw sampling batch size.")
+    parser.add_argument("--sampling_num_steps", type=int, default=None, help="Override final sampling diffusion steps.")
+    parser.add_argument(
+        "--class_match_sampling_attempts_max",
+        type=int,
+        default=None,
+        help="Override target-class constrained sampling retry count.",
+    )
+    parser.add_argument(
+        "--class_match_oversample_factor",
+        type=float,
+        default=None,
+        help="Override target-class constrained sampling oversample factor.",
+    )
+    parser.add_argument(
+        "--class_match_max_request_size",
+        type=int,
+        default=None,
+        help="Cap raw samples requested in any one class-match retry.",
+    )
+    parser.add_argument(
+        "--class_match_max_total_raw_samples",
+        type=int,
+        default=None,
+        help="Cap total raw samples drawn for one target-condition quota.",
+    )
+    parser.add_argument(
+        "--partial_quota_min_fill_ratio",
+        type=float,
+        default=None,
+        help="Allow partial target quotas once this fill ratio is reached.",
+    )
     parser.add_argument(
         "--sampling_seeds",
         default=None,
@@ -336,6 +425,17 @@ def main() -> None:
     _validate_positive_int("s2_early_stopping_patience_checks", args.s2_early_stopping_patience_checks)
     _validate_positive_int("rl_num_steps", args.rl_num_steps)
     _validate_positive_int("dpo_num_epochs", args.dpo_num_epochs)
+    _validate_positive_int("sampling_batch_size", args.sampling_batch_size)
+    _validate_positive_int("sampling_num_steps", args.sampling_num_steps)
+    _validate_positive_int("class_match_sampling_attempts_max", args.class_match_sampling_attempts_max)
+    _validate_positive_int("class_match_max_request_size", args.class_match_max_request_size)
+    _validate_positive_int("class_match_max_total_raw_samples", args.class_match_max_total_raw_samples)
+    if (args.target_temperature is None) != (args.target_phi is None):
+        raise ValueError("--target_temperature and --target_phi must be provided together.")
+    if args.class_match_oversample_factor is not None and float(args.class_match_oversample_factor) <= 0.0:
+        raise ValueError("class_match_oversample_factor must be > 0 when provided.")
+    if args.partial_quota_min_fill_ratio is not None and not (0.0 < float(args.partial_quota_min_fill_ratio) <= 1.0):
+        raise ValueError("partial_quota_min_fill_ratio must be in (0, 1] when provided.")
 
     resolved = load_step5_config(
         config_path=args.config,
@@ -343,10 +443,17 @@ def main() -> None:
         model_size=args.model_size,
         c_target_override=args.c_target,
     )
-    training_override = _build_training_override(args)
+    resolved = apply_step5_target_condition_filter(
+        resolved,
+        target_temperature=args.target_temperature,
+        target_phi=args.target_phi,
+    )
+    step5_override = _build_step5_override(args)
+    base_config_override = _build_base_config_override(args)
     resolved = _apply_cli_resolved_overrides(
         resolved,
-        training_override=training_override,
+        step5_override=step5_override,
+        base_config_override=base_config_override,
         method_root_suffix=args.method_root_suffix,
     )
     _prepare_shared_artifacts(resolved, config_path=args.config)
@@ -376,6 +483,9 @@ def main() -> None:
         extra_context["skip_disk_checkpoints"] = True
     if args.max_target_rows is not None:
         extra_context["max_target_rows"] = int(args.max_target_rows)
+    if args.target_temperature is not None and args.target_phi is not None:
+        extra_context["target_temperature"] = float(args.target_temperature)
+        extra_context["target_phi"] = float(args.target_phi)
     if args.generation_budget is not None:
         extra_context["generation_budget_override"] = int(args.generation_budget)
     if args.num_rounds is not None:
@@ -390,6 +500,20 @@ def main() -> None:
         extra_context["rl_num_steps_override"] = int(args.rl_num_steps)
     if args.dpo_num_epochs is not None:
         extra_context["dpo_num_epochs_override"] = int(args.dpo_num_epochs)
+    if args.sampling_batch_size is not None:
+        extra_context["sampling_batch_size_override"] = int(args.sampling_batch_size)
+    if args.sampling_num_steps is not None:
+        extra_context["sampling_num_steps_override"] = int(args.sampling_num_steps)
+    if args.class_match_sampling_attempts_max is not None:
+        extra_context["class_match_sampling_attempts_max_override"] = int(args.class_match_sampling_attempts_max)
+    if args.class_match_oversample_factor is not None:
+        extra_context["class_match_oversample_factor_override"] = float(args.class_match_oversample_factor)
+    if args.class_match_max_request_size is not None:
+        extra_context["class_match_max_request_size_override"] = int(args.class_match_max_request_size)
+    if args.class_match_max_total_raw_samples is not None:
+        extra_context["class_match_max_total_raw_samples_override"] = int(args.class_match_max_total_raw_samples)
+    if args.partial_quota_min_fill_ratio is not None:
+        extra_context["partial_quota_min_fill_ratio_override"] = float(args.partial_quota_min_fill_ratio)
     if sampling_seeds is not None:
         extra_context["sampling_seeds_override"] = sampling_seeds
     if args.no_figures:

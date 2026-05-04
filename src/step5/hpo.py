@@ -11,12 +11,12 @@ import time
 import warnings
 from copy import deepcopy
 from pathlib import Path
-from typing import Any, Dict, Tuple
+from typing import Any, Dict, List, Tuple
 
 import torch
 import yaml
 
-from .config import build_run_config, resolve_step5_hpo_generation_budget
+from .config import _deep_merge, build_run_config, resolve_step5_hpo_generation_budget
 from .plotting import plot_hpo_best_metric_curve, plot_hpo_best_success_curve
 from .run_core import execute_step5_run
 from .study_families import STUDY_BASE_RUNS
@@ -1479,6 +1479,12 @@ def refit_best_trial(
     model_size: str | None,
     device: str,
     fresh_refit: bool = False,
+    use_hpo_runtime_caps: bool = False,
+    run_cfg_override: Dict[str, Any] | None = None,
+    generation_budget: int | None = None,
+    sampling_seeds: List[int] | None = None,
+    num_rounds: int | None = None,
+    extra_context: Dict[str, Any] | None = None,
 ) -> Dict[str, Any] | None:
     if study_family not in STUDY_BASE_RUNS:
         raise ValueError(f"Unsupported Step 5 HPO study family: {study_family}")
@@ -1497,10 +1503,31 @@ def refit_best_trial(
     base_run_cfg = build_run_config(resolved, base_run_name)
     tuned_run_cfg = deepcopy(base_run_cfg)
     resolved_refit, tuned_run_cfg = _apply_trial_params(resolved, tuned_run_cfg, best_params)
+    if use_hpo_runtime_caps:
+        resolved_refit, tuned_run_cfg = _apply_hpo_runtime_overrides(
+            resolved_refit,
+            tuned_run_cfg,
+            study_family=study_family,
+        )
+    if run_cfg_override:
+        tuned_run_cfg = _deep_merge(tuned_run_cfg, deepcopy(run_cfg_override))
     tuned_run_cfg["run_name"] = f"{base_run_cfg['run_name']}_optuna"
     refit_run_dir = resolved_refit.method_root / tuned_run_cfg["run_name"]
     if fresh_refit and refit_run_dir.exists():
         shutil.rmtree(refit_run_dir)
+
+    refit_context = {
+        "base_config_path": base_config_path,
+        "model_size": model_size,
+        "study_family": study_family,
+        "hpo_refit": True,
+        "source_trial_number": best_payload.get("best_trial_number"),
+        "source_trial_params": best_params,
+        "source_best_params_path": str(best_params_path),
+        "use_hpo_runtime_caps": bool(use_hpo_runtime_caps),
+    }
+    if extra_context:
+        refit_context.update(extra_context)
 
     refit_result = execute_step5_run(
         resolved=resolved_refit,
@@ -1511,19 +1538,11 @@ def refit_best_trial(
         run_dir=refit_run_dir,
         shared_evaluator=None,
         target_rows_df=None,
-        generation_budget=None,
-        sampling_seeds=None,
-        num_rounds=None,
+        generation_budget=generation_budget,
+        sampling_seeds=sampling_seeds,
+        num_rounds=num_rounds,
         save_figures=True,
-        extra_context={
-            "base_config_path": base_config_path,
-            "model_size": model_size,
-            "study_family": study_family,
-            "hpo_refit": True,
-            "source_trial_number": best_payload.get("best_trial_number"),
-            "source_trial_params": best_params,
-            "source_best_params_path": str(best_params_path),
-        },
+        extra_context=refit_context,
     )
     return {
         "study_family": study_family,

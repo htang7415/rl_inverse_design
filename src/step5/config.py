@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from copy import deepcopy
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 import warnings
@@ -303,6 +303,130 @@ class ResolvedStep5Config:
     chi_train_stats: Dict[str, float]
     class_support_stats: Dict[str, Any]
     config_snapshot: Dict[str, Any]
+
+
+def apply_step5_output_suffix(
+    resolved: ResolvedStep5Config,
+    *,
+    method_root_suffix: str | None,
+) -> ResolvedStep5Config:
+    """Return a resolved config whose Step 5 output roots have a suffix."""
+
+    if method_root_suffix in {None, "", "null"}:
+        return resolved
+
+    suffix = str(method_root_suffix)
+    method_root = resolved.method_root.parent / f"{resolved.method_root.name}{suffix}"
+    compare_root = resolved.compare_root.parent / f"{resolved.compare_root.name}{suffix}"
+
+    snapshot = deepcopy(resolved.config_snapshot)
+    paths = snapshot.setdefault("paths", {})
+    if isinstance(paths, dict):
+        paths["method_root"] = str(method_root)
+        paths["compare_root"] = str(compare_root)
+
+    return replace(
+        resolved,
+        method_root=method_root,
+        compare_root=compare_root,
+        config_snapshot=snapshot,
+    )
+
+
+def filter_step5_target_rows_by_condition(
+    target_family_df: pd.DataFrame,
+    *,
+    target_temperature: float | None,
+    target_phi: float | None,
+    atol: float = 1.0e-6,
+) -> pd.DataFrame:
+    """Filter Step 5 benchmark rows to one exact target condition."""
+
+    if target_temperature is None and target_phi is None:
+        return target_family_df.copy()
+    if target_temperature is None or target_phi is None:
+        raise ValueError("target_temperature and target_phi must be provided together.")
+
+    work = target_family_df.copy()
+    if work.empty:
+        raise ValueError("Step 5 target table is empty; cannot apply a target-condition filter.")
+    required = {"temperature", "phi"}
+    if not required.issubset(work.columns):
+        raise ValueError(f"Step 5 target table must contain {sorted(required)} columns.")
+
+    temperature_match = np.isclose(
+        work["temperature"].astype(float),
+        float(target_temperature),
+        atol=float(atol),
+        rtol=0.0,
+    )
+    phi_match = np.isclose(
+        work["phi"].astype(float),
+        float(target_phi),
+        atol=float(atol),
+        rtol=0.0,
+    )
+    mask = temperature_match & phi_match
+    out = work.loc[mask].reset_index(drop=True).copy()
+    if out.empty:
+        available = (
+            work[["temperature", "phi"]]
+            .drop_duplicates()
+            .sort_values(["temperature", "phi"])
+            .head(30)
+            .to_dict(orient="records")
+        )
+        raise ValueError(
+            "No Step 5 target row matches "
+            f"target_temperature={float(target_temperature)} target_phi={float(target_phi)}. "
+            f"Available conditions include: {available}"
+        )
+    return out
+
+
+def apply_step5_target_condition_filter(
+    resolved: ResolvedStep5Config,
+    *,
+    target_temperature: float | None,
+    target_phi: float | None,
+    atol: float = 1.0e-6,
+) -> ResolvedStep5Config:
+    """Return a resolved config restricted to one target temperature/phi row."""
+
+    if target_temperature is None and target_phi is None:
+        return resolved
+
+    target_rows = filter_step5_target_rows_by_condition(
+        resolved.target_family_df,
+        target_temperature=target_temperature,
+        target_phi=target_phi,
+        atol=atol,
+    )
+    step5_cfg = deepcopy(resolved.step5)
+    step5_cfg["target_temperature"] = float(target_temperature)
+    step5_cfg["target_phi"] = float(target_phi)
+
+    snapshot = deepcopy(resolved.config_snapshot)
+    snapshot["step5"] = _as_serializable(step5_cfg)
+    derived = snapshot.setdefault("derived", {})
+    if isinstance(derived, dict):
+        derived["num_target_rows"] = int(len(target_rows))
+        derived["target_condition_filter"] = {
+            "target_temperature": float(target_temperature),
+            "target_phi": float(target_phi),
+            "atol": float(atol),
+            "matched_target_row_ids": [
+                int(value)
+                for value in target_rows.get("target_row_id", pd.Series(dtype=int)).tolist()
+            ],
+        }
+
+    return replace(
+        resolved,
+        step5=step5_cfg,
+        target_family_df=target_rows,
+        config_snapshot=snapshot,
+    )
 
 
 def _resolve_step4_dirs(

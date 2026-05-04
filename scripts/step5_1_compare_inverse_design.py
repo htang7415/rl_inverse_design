@@ -14,7 +14,7 @@ import yaml
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from src.step5.config import load_step5_config
+from src.step5.config import apply_step5_output_suffix, load_step5_config
 from src.step5.study_families import STUDY_BASE_RUNS
 from src.step5.plotting import (
     plot_alignment_training_curves,
@@ -745,6 +745,11 @@ def main() -> None:
     )
     parser.add_argument("--runs", default=None, help="Comma-separated subset of enabled runs to compare.")
     parser.add_argument("--allow_partial", action="store_true", help="Skip missing/incomplete runs for development.")
+    parser.add_argument(
+        "--method_root_suffix",
+        default=None,
+        help="Optional suffix appended to the Step 5 method and comparison roots.",
+    )
     args = parser.parse_args()
 
     resolved = load_step5_config(
@@ -753,6 +758,7 @@ def main() -> None:
         model_size=args.model_size,
         c_target_override=args.c_target,
     )
+    resolved = apply_step5_output_suffix(resolved, method_root_suffix=args.method_root_suffix)
     selected_runs = _resolve_selected_runs(resolved, args.runs, allow_partial=bool(args.allow_partial))
 
     run_payloads: List[Dict[str, object]] = []
