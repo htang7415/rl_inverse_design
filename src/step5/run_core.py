@@ -12,7 +12,12 @@ import pandas as pd
 import torch
 import yaml
 
-from .config import build_run_config, resolve_step5_generation_budget, resolve_step5_sampling_num_steps
+from .config import (
+    build_run_config,
+    filter_step5_target_rows_by_condition,
+    resolve_step5_generation_budget,
+    resolve_step5_sampling_num_steps,
+)
 from .conditional_sampling import create_conditional_sampler, sample_conditional_with_class_prior
 from .dataset import ConditionScaler, build_inference_condition_bundle_from_target_row
 from .dpo import train_s4_dpo_alignment
@@ -26,9 +31,10 @@ from .evaluation import (
     summarize_target_rows,
 )
 from .frozen_sampling import (
-    create_constrained_sampler,
+    create_raw_step1_sampler,
     load_step1_diffusion,
     resolve_class_sampling_prior,
+    sample_raw_step1_unconditional,
     sample_unconditional_with_class_prior,
 )
 from .guided_sampler import GuidedConditionalSampler, GuidedSampler
@@ -75,6 +81,41 @@ def _resolve_cross_target_duplicate_rejection_enabled(resolved) -> bool:
             continue
         return bool(raw_value)
     return default_value
+
+
+def _is_missing_config_value(value: object) -> bool:
+    return value is None or (isinstance(value, str) and value.strip().lower() in {"", "null", "none"})
+
+
+def _resolve_s0_target_condition(resolved, run_cfg: Dict[str, object]) -> Tuple[Optional[float], Optional[float]]:
+    if str(run_cfg.get("run_name", "")) != "S0_raw_unconditional":
+        return None, None
+    if not bool(resolved.step5.get("s0_use_configured_target_condition", False)):
+        return None, None
+
+    raw_temperature = resolved.step5.get("target_temperature")
+    raw_phi = resolved.step5.get("target_phi")
+    if _is_missing_config_value(raw_temperature) and _is_missing_config_value(raw_phi):
+        chi_cfg = resolved.base_config.get("chi_training", {})
+        design_cfg = (
+            chi_cfg.get("step5_inverse_design", {})
+            if isinstance(chi_cfg.get("step5_inverse_design", {}), dict)
+            else {}
+        )
+        if not design_cfg:
+            legacy_cfg = chi_cfg.get("step5_class_inverse_design", {})
+            if isinstance(legacy_cfg, dict):
+                design_cfg = legacy_cfg
+        raw_temperature = design_cfg.get("target_temperature")
+        raw_phi = design_cfg.get("target_phi")
+
+    if _is_missing_config_value(raw_temperature) and _is_missing_config_value(raw_phi):
+        return None, None
+    if _is_missing_config_value(raw_temperature) or _is_missing_config_value(raw_phi):
+        raise ValueError(
+            "S0 configured target-condition filtering requires both target_temperature and target_phi."
+        )
+    return float(raw_temperature), float(raw_phi)
 
 
 def _resolve_hpo_sampling_objective_column(metric_name: str, evaluation_df: pd.DataFrame) -> Optional[str]:
@@ -512,22 +553,19 @@ def run_single_target_sampling(
     sampling_state: Optional[Dict[str, object]] = None,
 ) -> Tuple[List[str], Dict[str, int], Dict[str, object]]:
     if run_cfg["run_name"] == "S0_raw_unconditional":
-        sampler = create_constrained_sampler(
+        sampler = create_raw_step1_sampler(
             diffusion_model=diffusion_model,
             tokenizer=tokenizer,
             resolved=resolved,
-            prior=prior,
             device=device,
         )
-        smiles, sample_meta = sample_unconditional_with_class_prior(
+        smiles, sample_meta = sample_raw_step1_unconditional(
             sampler=sampler,
             tokenizer=tokenizer,
-            prior=prior,
             resolved=resolved,
             num_samples=int(generation_budget),
             show_progress=False,
-            seen_canonical_smiles=seen_canonical_smiles,
-            sampling_state=sampling_state,
+            source_lengths=list(getattr(prior, "fallback_source_lengths", []) or []),
         )
         return smiles, {"training_soluble_oracle_calls": 0, "training_chi_oracle_calls": 0}, sample_meta
 
@@ -552,6 +590,8 @@ def run_single_target_sampling(
             sol_log_prob_floor=float(s1_cfg["sol_log_prob_floor"]),
             w_sol=float(s1_cfg["w_sol"]),
             w_chi=float(s1_cfg["w_chi"]),
+            w_sa=float(s1_cfg.get("w_sa", 0.0)),
+            w_sa_continuous=float(s1_cfg.get("w_sa_continuous", 0.0)),
             invalid_reward_penalty=float(s1_cfg.get("invalid_reward_penalty", -10.0)),
         )
         sampler.set_class_token_bias_start_frac(float(resolved.step5.get("class_token_bias_start_frac", 0.0)))
@@ -636,6 +676,8 @@ def run_single_target_sampling(
             sol_log_prob_floor=float(s3_cfg["sol_log_prob_floor"]),
             w_sol=float(s3_cfg["w_sol"]),
             w_chi=float(s3_cfg["w_chi"]),
+            w_sa=float(s3_cfg.get("w_sa", 0.0)),
+            w_sa_continuous=float(s3_cfg.get("w_sa_continuous", 0.0)),
             invalid_reward_penalty=float(s3_cfg.get("invalid_reward_penalty", -10.0)),
         )
         sampler.set_class_token_bias_start_frac(float(resolved.step5.get("class_token_bias_start_frac", 0.0)))
@@ -689,6 +731,31 @@ def run_single_target_sampling(
     raise NotImplementedError(f"Unsupported Step 5 run: {run_cfg['run_name']}")
 
 
+def _resolve_round_generation_budgets(
+    *,
+    generation_budget: int,
+    num_rounds: int,
+    preserve_total_generation_across_rounds: bool,
+) -> List[int]:
+    """Return the per-round sampling budget for one target row."""
+
+    generation_budget = int(generation_budget)
+    num_rounds = int(num_rounds)
+    if generation_budget <= 0:
+        raise ValueError("generation_budget must be >= 1.")
+    if num_rounds <= 0:
+        raise ValueError("num_rounds must be >= 1.")
+    if not preserve_total_generation_across_rounds:
+        return [generation_budget for _ in range(num_rounds)]
+    if generation_budget < num_rounds:
+        raise ValueError(
+            "step5.generation_budget must be >= step5.num_sampling_rounds when "
+            "step5.preserve_total_generation_across_rounds is true."
+        )
+    base_budget, extra_rounds = divmod(generation_budget, num_rounds)
+    return [base_budget + (1 if idx < extra_rounds else 0) for idx in range(num_rounds)]
+
+
 def execute_step5_run(
     *,
     resolved,
@@ -712,6 +779,28 @@ def execute_step5_run(
     run_dir = run_dir or (resolved.method_root / str(run_cfg["run_name"]))
     explicit_target_rows = target_rows_df is not None
     target_rows_df = target_rows_df.copy() if explicit_target_rows else resolved.target_family_df.copy()
+    s0_target_condition_filter: Optional[Dict[str, Any]] = None
+    s0_target_temperature, s0_target_phi = _resolve_s0_target_condition(resolved, run_cfg)
+    if s0_target_temperature is not None and s0_target_phi is not None:
+        try:
+            target_rows_df = filter_step5_target_rows_by_condition(
+                target_rows_df,
+                target_temperature=float(s0_target_temperature),
+                target_phi=float(s0_target_phi),
+            )
+        except ValueError:
+            if not explicit_target_rows:
+                raise
+            target_rows_df = filter_step5_target_rows_by_condition(
+                resolved.target_family_df,
+                target_temperature=float(s0_target_temperature),
+                target_phi=float(s0_target_phi),
+            )
+        s0_target_condition_filter = {
+            "target_temperature": float(s0_target_temperature),
+            "target_phi": float(s0_target_phi),
+            "matched_target_rows": int(len(target_rows_df)),
+        }
     raw_max_target_rows = resolved.step5.get("max_target_rows")
     if not explicit_target_rows and raw_max_target_rows not in {None, "", "null"}:
         max_target_rows = int(raw_max_target_rows)
@@ -723,12 +812,23 @@ def execute_step5_run(
     generation_budget = int(
         generation_budget
         if generation_budget is not None
-        else resolve_step5_generation_budget(resolved.step5, resolved.c_target)
+        else resolve_step5_generation_budget(run_cfg, resolved.c_target)
     )
     sampling_seeds = list(sampling_seeds if sampling_seeds is not None else resolved.step5["sampling_seeds"])
     num_rounds = int(num_rounds if num_rounds is not None else resolved.step5["num_sampling_rounds"])
     if num_rounds > len(sampling_seeds):
         raise ValueError("num_rounds exceeds the number of provided sampling seeds.")
+    preserve_total_generation_across_rounds = bool(
+        run_cfg.get("preserve_total_generation_across_rounds", False)
+    )
+    round_generation_budgets = _resolve_round_generation_budgets(
+        generation_budget=generation_budget,
+        num_rounds=num_rounds,
+        preserve_total_generation_across_rounds=preserve_total_generation_across_rounds,
+    )
+    generation_budget_mode = (
+        "total_across_rounds" if preserve_total_generation_across_rounds else "per_round"
+    )
 
     skip_disk_checkpoints = bool(extra_context.get("skip_disk_checkpoints", False))
     run_dirs = create_run_dirs(run_dir, create_checkpoints_dir=not skip_disk_checkpoints)
@@ -744,8 +844,15 @@ def execute_step5_run(
         run_dirs["run_dir"],
         (
             f"Run start | run={run_cfg['run_name']} family={canonical_family} "
-            f"generation_budget={int(generation_budget)} num_rounds={int(num_rounds)} "
+            f"generation_budget={int(generation_budget)} generation_budget_mode={generation_budget_mode} "
+            f"num_rounds={int(num_rounds)} round_generation_budgets={round_generation_budgets} "
             f"target_rows={int(len(target_rows_df))}"
+            + (
+                f" s0_target_condition=T{float(s0_target_condition_filter['target_temperature']):.6g},"
+                f"phi{float(s0_target_condition_filter['target_phi']):.6g}"
+                if s0_target_condition_filter is not None
+                else ""
+            )
         ),
         echo=True,
     )
@@ -877,8 +984,28 @@ def execute_step5_run(
         )
     else:
         tokenizer, diffusion_model, checkpoint_path = load_step1_diffusion(resolved, device=device)
-        prior = resolve_class_sampling_prior(resolved, run_cfg, tokenizer, metrics_dir=run_dirs["metrics_dir"])
+        s0_raw_step1_baseline = str(run_cfg["run_name"]) == "S0_raw_unconditional"
+        prior = resolve_class_sampling_prior(
+            resolved,
+            run_cfg,
+            tokenizer,
+            metrics_dir=(None if s0_raw_step1_baseline else run_dirs["metrics_dir"]),
+        )
         _write_json({"checkpoint_path": str(checkpoint_path)}, run_dirs["metrics_dir"] / "step1_checkpoint.json")
+        if s0_raw_step1_baseline:
+            _write_json(
+                {
+                    "sampling_mode": "step1_unconditional",
+                    "class_aware_decode_constraints_enabled": False,
+                    "class_token_bias_enabled": False,
+                    "family_sampling_mode": "none",
+                    "enforce_class_match": False,
+                    "enforce_backbone_class_match": False,
+                    "enforce_star_ok_acceptance": False,
+                    "target_condition_filter": s0_target_condition_filter,
+                },
+                run_dirs["metrics_dir"] / "s0_raw_step1_sampling.json",
+            )
 
     sampling_wall_time_seconds = 0.0
     evaluation_wall_time_seconds = 0.0
@@ -901,12 +1028,16 @@ def execute_step5_run(
         evaluator = load_step5_evaluator(resolved, device=device)
     model_setup_wall_time_seconds = time.perf_counter() - model_setup_start
 
-    for round_id, sampling_seed in enumerate(sampling_seeds[:num_rounds], start=1):
+    for round_id, (sampling_seed, round_generation_budget) in enumerate(
+        zip(sampling_seeds[:num_rounds], round_generation_budgets),
+        start=1,
+    ):
         append_log_message(
             run_dirs["run_dir"],
             (
                 f"Sampling round start | run={run_cfg['run_name']} "
                 f"round={int(round_id)}/{int(num_rounds)} seed={int(sampling_seed)} "
+                f"generation_budget={int(round_generation_budget)} "
                 f"target_rows={int(len(target_rows_df))}"
             ),
             echo=True,
@@ -949,7 +1080,7 @@ def execute_step5_run(
                 evaluator=evaluator,
                 device=device,
                 s2_scaler=s2_scaler,
-                generation_budget=generation_budget,
+                generation_budget=int(round_generation_budget),
                 seen_canonical_smiles=round_seen_canonical_smiles,
                 sampling_state=round_sampling_state,
             )
@@ -1003,6 +1134,9 @@ def execute_step5_run(
                     "temperature": float(target_row["temperature"]),
                     "phi": float(target_row["phi"]),
                     "chi_target": float(target_row["chi_target"]),
+                    "configured_generation_budget": int(generation_budget),
+                    "round_generation_budget": int(round_generation_budget),
+                    "generation_budget_mode": generation_budget_mode,
                     "target_sampling_wall_time_seconds": float(target_sampling_wall_time_seconds),
                     "target_evaluation_wall_time_seconds": float(target_evaluation_wall_time_seconds),
                     **sample_meta,
@@ -1040,6 +1174,7 @@ def execute_step5_run(
                     metrics={
                         "objective_metric": hpo_objective_metric,
                         "sampling_objective_column": objective_column,
+                        "pruning_metric": str(objective_column or hpo_objective_metric),
                         "cumulative_sampling_objective": float(cumulative_objective),
                         "cumulative_sampling_samples": int(hpo_objective_count),
                         "round_id": int(round_id),
@@ -1122,23 +1257,53 @@ def execute_step5_run(
         )
 
     method_metrics = build_method_metrics(round_metrics_df, target_row_summary_df)
+    class_aware_sampling_enabled = str(run_cfg["run_name"]) != "S0_raw_unconditional"
+    method_family_sampling_mode = str(prior.family_sampling_mode) if class_aware_sampling_enabled else "none"
+    method_family_sampling_scope = str(prior.family_sampling_scope) if class_aware_sampling_enabled else "none"
+    method_center_min_frac = float(prior.center_min_frac) if class_aware_sampling_enabled else 0.0
+    method_center_max_frac = float(prior.center_max_frac) if class_aware_sampling_enabled else 0.0
+    method_spans_per_sample = int(prior.spans_per_sample) if class_aware_sampling_enabled else 0
+    method_backbone_min_gap = int(prior.backbone_template_min_gap_tokens) if class_aware_sampling_enabled else 0
+    method_backbone_core_count = int(len(prior.backbone_template_cores)) if class_aware_sampling_enabled else 0
+    method_backbone_max_core_length = (
+        float(max((len(tokenizer.tokenize(core)) for core in prior.backbone_template_cores), default=0))
+        if class_aware_sampling_enabled
+        else 0.0
+    )
+    method_enforce_star_ok_acceptance = (
+        int(bool(prior.enforce_star_ok_acceptance)) if class_aware_sampling_enabled else 0
+    )
+    method_class_token_bias_enabled = (
+        int(bool(prior.class_token_logit_bias is not None)) if class_aware_sampling_enabled else 0
+    )
+    method_class_token_bias_strength = float(prior.class_token_bias_strength) if class_aware_sampling_enabled else 0.0
     method_metrics.update(
         {
             "run_name": str(run_cfg["run_name"]),
             "canonical_family": str(run_cfg["canonical_family"]),
-            "family_sampling_mode": str(prior.family_sampling_mode),
-            "family_sampling_scope": str(prior.family_sampling_scope),
-            "family_sampling_center_min_frac": float(prior.center_min_frac),
-            "family_sampling_center_max_frac": float(prior.center_max_frac),
-            "family_sampling_spans_per_sample": int(prior.spans_per_sample),
-            "backbone_template_min_gap_tokens": int(prior.backbone_template_min_gap_tokens),
-            "backbone_template_core_count": int(len(prior.backbone_template_cores)),
-            "backbone_template_max_core_token_length": float(
-                max((len(tokenizer.tokenize(core)) for core in prior.backbone_template_cores), default=0)
+            "class_aware_sampling_enabled": int(bool(class_aware_sampling_enabled)),
+            "s0_target_condition_filter_enabled": int(bool(s0_target_condition_filter is not None)),
+            "s0_target_temperature": (
+                float(s0_target_condition_filter["target_temperature"])
+                if s0_target_condition_filter is not None
+                else None
             ),
-            "enforce_star_ok_acceptance": int(bool(prior.enforce_star_ok_acceptance)),
-            "class_token_bias_enabled": int(bool(prior.class_token_logit_bias is not None)),
-            "class_token_bias_strength": float(prior.class_token_bias_strength),
+            "s0_target_phi": (
+                float(s0_target_condition_filter["target_phi"])
+                if s0_target_condition_filter is not None
+                else None
+            ),
+            "family_sampling_mode": method_family_sampling_mode,
+            "family_sampling_scope": method_family_sampling_scope,
+            "family_sampling_center_min_frac": method_center_min_frac,
+            "family_sampling_center_max_frac": method_center_max_frac,
+            "family_sampling_spans_per_sample": method_spans_per_sample,
+            "backbone_template_min_gap_tokens": method_backbone_min_gap,
+            "backbone_template_core_count": method_backbone_core_count,
+            "backbone_template_max_core_token_length": method_backbone_max_core_length,
+            "enforce_star_ok_acceptance": method_enforce_star_ok_acceptance,
+            "class_token_bias_enabled": method_class_token_bias_enabled,
+            "class_token_bias_strength": method_class_token_bias_strength,
             "mean_training_soluble_oracle_calls": (
                 float(round_metrics_df["training_soluble_oracle_calls"].mean())
                 if "training_soluble_oracle_calls" in round_metrics_df.columns and not round_metrics_df.empty
@@ -1172,6 +1337,9 @@ def execute_step5_run(
             "evaluated_samples": int(len(evaluation_results_df)),
             "target_rows": int(len(target_rows_df)),
             "generation_budget": int(generation_budget),
+            "generation_budget_mode": generation_budget_mode,
+            "round_generation_budgets": [int(value) for value in round_generation_budgets],
+            "total_generation_budget_per_target": int(sum(round_generation_budgets)),
             "num_sampling_rounds": int(num_rounds),
         }
     )
@@ -1193,15 +1361,25 @@ def execute_step5_run(
                 "mean_class_match_oversampling_ratio": float(sampling_meta_df["class_match_oversampling_ratio"].mean())
                 if "class_match_oversampling_ratio" in sampling_meta_df.columns
                 else 0.0,
-                "family_sampling_mode": str(prior.family_sampling_mode),
-                "family_sampling_scope": str(prior.family_sampling_scope),
-                "family_sampling_center_min_frac": float(prior.center_min_frac),
-                "family_sampling_center_max_frac": float(prior.center_max_frac),
-                "backbone_template_min_gap_tokens": int(prior.backbone_template_min_gap_tokens),
-                "backbone_template_max_core_token_length": float(
-                    max((len(tokenizer.tokenize(core)) for core in prior.backbone_template_cores), default=0)
+                "class_aware_sampling_enabled": int(bool(class_aware_sampling_enabled)),
+                "s0_target_condition_filter_enabled": int(bool(s0_target_condition_filter is not None)),
+                "s0_target_temperature": (
+                    float(s0_target_condition_filter["target_temperature"])
+                    if s0_target_condition_filter is not None
+                    else None
                 ),
-                "enforce_star_ok_acceptance": int(bool(prior.enforce_star_ok_acceptance)),
+                "s0_target_phi": (
+                    float(s0_target_condition_filter["target_phi"])
+                    if s0_target_condition_filter is not None
+                    else None
+                ),
+                "family_sampling_mode": method_family_sampling_mode,
+                "family_sampling_scope": method_family_sampling_scope,
+                "family_sampling_center_min_frac": method_center_min_frac,
+                "family_sampling_center_max_frac": method_center_max_frac,
+                "backbone_template_min_gap_tokens": method_backbone_min_gap,
+                "backbone_template_max_core_token_length": method_backbone_max_core_length,
+                "enforce_star_ok_acceptance": method_enforce_star_ok_acceptance,
                 "mean_total_raw_samples_drawn": float(sampling_meta_df["total_raw_samples_drawn"].mean())
                 if "total_raw_samples_drawn" in sampling_meta_df.columns
                 else 0.0,

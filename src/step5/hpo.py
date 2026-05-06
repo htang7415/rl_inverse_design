@@ -8,6 +8,7 @@ import math
 import shutil
 import tempfile
 import time
+import traceback
 import warnings
 from copy import deepcopy
 from pathlib import Path
@@ -35,7 +36,14 @@ def _require_optuna():
 
 def _hpo_root(resolved) -> Path:
     root_dirname = str(resolved.step5_hpo.get("root_dirname", "step5_hpo")).strip() or "step5_hpo"
-    return resolved.results_dir / root_dirname / resolved.split_mode / resolved.c_target
+    root_suffix = str(resolved.step5_hpo.get("root_suffix", "") or "")
+    return resolved.results_dir / root_dirname / resolved.split_mode / f"{resolved.c_target}{root_suffix}"
+
+
+def get_hpo_root(resolved) -> Path:
+    """Return the resolved Step 5 HPO root directory."""
+
+    return _hpo_root(resolved)
 
 
 def _study_root(resolved, *, study_family: str) -> Path:
@@ -110,24 +118,48 @@ def _tighten_step5_decode_class_cap(
     step5_decode_cfg[overrides_key] = class_overrides
 
 
-def _build_optuna_pruner(resolved):
-    pruner_name = str(resolved.step5_hpo.get("pruner", "median")).strip().lower()
+def _json_safe(value: Any) -> Any:
+    if value is None or isinstance(value, (str, bool, int, float)):
+        return value
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, dict):
+        return {str(key): _json_safe(val) for key, val in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(item) for item in value]
+    if hasattr(value, "item"):
+        try:
+            return _json_safe(value.item())
+        except Exception:
+            pass
+    return str(value)
+
+
+def _build_optuna_pruner(resolved, *, study_family: str | None = None):
+    hpo_cfg = (
+        _resolve_hpo_runtime_config(resolved, study_family=study_family)
+        if study_family is not None
+        else dict(resolved.step5_hpo)
+    )
+    pruner_name = str(hpo_cfg.get("pruner", "median")).strip().lower()
+    if pruner_name in {"none", "nop", "disabled", "off"}:
+        return optuna.pruners.NopPruner()
     if pruner_name == "median":
         return optuna.pruners.MedianPruner(
-            n_startup_trials=int(resolved.step5_hpo.get("pruner_n_startup_trials", 2)),
-            n_warmup_steps=int(resolved.step5_hpo.get("pruner_n_warmup_steps", 1)),
+            n_startup_trials=int(hpo_cfg.get("pruner_n_startup_trials", 2)),
+            n_warmup_steps=int(hpo_cfg.get("pruner_n_warmup_steps", 1)),
         )
     if pruner_name == "successive_halving":
         return optuna.pruners.SuccessiveHalvingPruner(
-            min_resource=int(resolved.step5_hpo.get("pruner_min_resource", 1)),
-            reduction_factor=int(resolved.step5_hpo.get("pruner_reduction_factor", 2)),
-            min_early_stopping_rate=int(resolved.step5_hpo.get("pruner_min_early_stopping_rate", 0)),
+            min_resource=int(hpo_cfg.get("pruner_min_resource", 1)),
+            reduction_factor=int(hpo_cfg.get("pruner_reduction_factor", 2)),
+            min_early_stopping_rate=int(hpo_cfg.get("pruner_min_early_stopping_rate", 0)),
         )
     if pruner_name == "hyperband":
         return optuna.pruners.HyperbandPruner(
-            min_resource=int(resolved.step5_hpo.get("pruner_min_resource", 1)),
-            max_resource=str(resolved.step5_hpo.get("pruner_max_resource", "auto")),
-            reduction_factor=int(resolved.step5_hpo.get("pruner_reduction_factor", 2)),
+            min_resource=int(hpo_cfg.get("pruner_min_resource", 1)),
+            max_resource=str(hpo_cfg.get("pruner_max_resource", "auto")),
+            reduction_factor=int(hpo_cfg.get("pruner_reduction_factor", 2)),
         )
     raise ValueError(f"Unsupported Step 5 HPO pruner: {pruner_name}")
 
@@ -137,10 +169,12 @@ def _storage_uri(resolved, *, study_family: str | None = None) -> str:
     if not raw:
         default_root = _hpo_root(resolved) / study_family if study_family else _hpo_root(resolved)
         return f"sqlite:///{default_root / 'optuna.db'}"
+    root_suffix = str(resolved.step5_hpo.get("root_suffix", "") or "")
+    c_target_component = f"{resolved.c_target}{root_suffix}"
     substituted = (
         raw.replace("<model_size>", str(resolved.model_size))
         .replace("<split_mode>", str(resolved.split_mode))
-        .replace("<c_target>", str(resolved.c_target))
+        .replace("<c_target>", str(c_target_component))
     )
     if study_family:
         substituted = substituted.replace("<study_family>", study_family)
@@ -396,6 +430,11 @@ def _apply_hpo_runtime_overrides(
         )
         if hpo_dpo_proxy_eval_interval_epochs is not None:
             dpo_cfg["proxy_eval_interval_epochs"] = int(hpo_dpo_proxy_eval_interval_epochs)
+        hpo_dpo_num_epochs = _resolve_optional_positive_int(
+            hpo_cfg.get("hpo_s4_dpo_num_epochs")
+        )
+        if hpo_dpo_num_epochs is not None:
+            dpo_cfg["num_epochs"] = int(hpo_dpo_num_epochs)
         run_cfg["s4"]["dpo"] = dpo_cfg
 
     return resolved, run_cfg
@@ -419,6 +458,10 @@ def _apply_trial_params(resolved, run_cfg: Dict[str, object], params: Dict[str, 
         )
         if "sol_log_prob_floor" in params:
             run_cfg["s1"]["sol_log_prob_floor"] = float(params["sol_log_prob_floor"])
+        if "w_sa" in params:
+            run_cfg["s1"]["w_sa"] = float(params["w_sa"])
+        if "w_sa_continuous" in params:
+            run_cfg["s1"]["w_sa_continuous"] = float(params["w_sa_continuous"])
     elif family == "S2":
         _update_s2_model_params(run_cfg, params)
         _update_s2_training_params(run_cfg, params)
@@ -441,6 +484,10 @@ def _apply_trial_params(resolved, run_cfg: Dict[str, object], params: Dict[str, 
         )
         if "sol_log_prob_floor" in params:
             run_cfg["s3"]["sol_log_prob_floor"] = float(params["sol_log_prob_floor"])
+        if "w_sa" in params:
+            run_cfg["s3"]["w_sa"] = float(params["w_sa"])
+        if "w_sa_continuous" in params:
+            run_cfg["s3"]["w_sa_continuous"] = float(params["w_sa_continuous"])
     elif family == "S4":
         alignment_mode = str(run_cfg["s4"]["alignment_mode"]).strip().lower()
         run_cfg["s4"]["cfg_scale"] = float(params["cfg_scale"])
@@ -476,7 +523,6 @@ def _apply_trial_params(resolved, run_cfg: Dict[str, object], params: Dict[str, 
             run_cfg["s4"]["kl_weight"] = float(params["kl_weight"])
             run_cfg["s4"]["learning_rate"] = float(params["rl_learning_rate"])
             if alignment_mode in {"ppo", "grpo"}:
-                run_cfg["s4"]["policy_update_epochs"] = int(params["policy_update_epochs"])
                 run_cfg["s4"]["ppo_clip_eps"] = float(params["ppo_clip_eps"])
                 run_cfg["s4"]["normalize_advantages"] = True
             if alignment_mode == "grpo":
@@ -489,7 +535,6 @@ def _apply_trial_params(resolved, run_cfg: Dict[str, object], params: Dict[str, 
                     "beta": float(params["beta"]),
                     "learning_rate": float(params["learning_rate"]),
                     "batch_size": int(params["batch_size"]),
-                    "num_epochs": int(params["num_epochs"]),
                 }
             )
             if "d_water_budget_fraction" in params:
@@ -547,6 +592,8 @@ def suggest_trial_params(trial, *, study_family: str, resolved, run_cfg: Dict[st
         params["guidance_start_frac"] = trial.suggest_float("guidance_start_frac", 0.0, 0.85)
         params["w_sol"] = trial.suggest_float("w_sol", 0.25, 4.0, log=True)
         params["w_chi"] = trial.suggest_float("w_chi", 0.5, 4.0, log=True)
+        params["w_sa"] = trial.suggest_float("w_sa", 0.0, 1.5)
+        params["w_sa_continuous"] = trial.suggest_float("w_sa_continuous", 0.0, 2.0)
         params["sol_log_prob_floor"] = trial.suggest_float("sol_log_prob_floor", -12.0, -4.0)
     elif study_family == "S2":
         params["variant"] = trial.suggest_categorical("variant", ["pure", "mt"])
@@ -577,6 +624,8 @@ def suggest_trial_params(trial, *, study_family: str, resolved, run_cfg: Dict[st
         params["guidance_start_frac"] = trial.suggest_float("guidance_start_frac", 0.0, 0.85)
         params["w_sol"] = trial.suggest_float("w_sol", 0.25, 4.0, log=True)
         params["w_chi"] = trial.suggest_float("w_chi", 0.5, 4.0, log=True)
+        params["w_sa"] = trial.suggest_float("w_sa", 0.0, 1.5)
+        params["w_sa_continuous"] = trial.suggest_float("w_sa_continuous", 0.0, 2.0)
         params["sol_log_prob_floor"] = trial.suggest_float("sol_log_prob_floor", -12.0, -4.0)
     elif study_family == "S4_rl":
         params["w_success"] = trial.suggest_float("w_success", 0.5, 4.0, log=True)
@@ -632,7 +681,6 @@ def suggest_trial_params(trial, *, study_family: str, resolved, run_cfg: Dict[st
         params["reward_curriculum_dense_final_scale"] = trial.suggest_float(
             "reward_curriculum_dense_final_scale", 0.25, 1.0
         )
-        params["policy_update_epochs"] = trial.suggest_categorical("policy_update_epochs", [1, 2])
         params["ppo_clip_eps"] = trial.suggest_float("ppo_clip_eps", 0.10, 0.30)
     elif study_family == "S4_grpo":
         params["w_success"] = trial.suggest_float("w_success", 0.5, 4.0, log=True)
@@ -661,7 +709,6 @@ def suggest_trial_params(trial, *, study_family: str, resolved, run_cfg: Dict[st
         params["reward_curriculum_dense_final_scale"] = trial.suggest_float(
             "reward_curriculum_dense_final_scale", 0.25, 1.0
         )
-        params["policy_update_epochs"] = trial.suggest_categorical("policy_update_epochs", [1, 2])
         params["ppo_clip_eps"] = trial.suggest_float("ppo_clip_eps", 0.10, 0.30)
         params["grpo_group_size"] = trial.suggest_categorical(
             "grpo_group_size",
@@ -678,10 +725,6 @@ def suggest_trial_params(trial, *, study_family: str, resolved, run_cfg: Dict[st
         params["batch_size"] = trial.suggest_categorical(
             "batch_size",
             _hpo_choice_list(dpo_hpo_cfg, "hpo_s4_dpo_batch_size_choices", [32, 64]),
-        )
-        params["num_epochs"] = trial.suggest_categorical(
-            "num_epochs",
-            _hpo_choice_list(dpo_hpo_cfg, "hpo_s4_dpo_num_epochs_choices", [4, 6]),
         )
         dpo_cfg_scale_min = float(dpo_hpo_cfg.get("hpo_s4_dpo_cfg_scale_min", 0.5) or 0.5)
         if dpo_cfg_scale_min >= 2.0:
@@ -760,6 +803,8 @@ def _compute_selection_objective_value(
     objective_value: float,
     mean_class_match_acceptance_rate: float,
     mean_total_raw_samples_drawn: float,
+    generated_samples: int | None,
+    expected_generated_samples: int | None,
     hpo_cfg: Dict[str, Any],
 ) -> tuple[float, bool, list[str]]:
     selection_value = float(objective_value)
@@ -799,6 +844,25 @@ def _compute_selection_objective_value(
                 "mean_total_raw_samples_drawn_above_ceiling:"
                 f"{float(mean_total_raw_samples_drawn):.6g}>{float(max_total_raw_samples):.6g}"
             )
+    raw_min_generated_fraction = hpo_cfg.get("efficiency_min_generated_fraction", None)
+    if raw_min_generated_fraction not in {None, "", "null"}:
+        min_generated_fraction = float(raw_min_generated_fraction)
+        if min_generated_fraction > 0.0:
+            expected = int(expected_generated_samples or 0)
+            generated = int(generated_samples or 0)
+            if expected <= 0:
+                notes.append("expected_generated_samples_missing_or_nonpositive")
+            else:
+                generated_fraction = float(generated) / float(expected)
+                if generated_fraction <= 0.0:
+                    selection_value = float("-inf")
+                    notes.append("generated_fraction_missing_or_zero")
+                elif generated_fraction < min_generated_fraction:
+                    selection_value *= max(0.0, generated_fraction / min_generated_fraction)
+                    notes.append(
+                        "generated_fraction_below_floor:"
+                        f"{generated_fraction:.6g}<{min_generated_fraction:.6g}"
+                    )
     return float(selection_value), len(notes) == 0, notes
 
 
@@ -829,7 +893,18 @@ def _write_trial_summary(
     sampling_wall_time_sec: float | None = None,
     evaluation_wall_time_sec: float | None = None,
     generated_samples: int | None = None,
+    expected_generated_samples: int | None = None,
+    generated_fill_fraction: float | None = None,
     target_rows: int | None = None,
+    last_intermediate_stage: str | None = None,
+    last_intermediate_source_step: int | None = None,
+    last_intermediate_report_step: int | None = None,
+    last_intermediate_value: float | None = None,
+    last_intermediate_metrics: Dict[str, Any] | None = None,
+    prune_reason: str | None = None,
+    failure_type: str | None = None,
+    failure_message: str | None = None,
+    failure_traceback: str | None = None,
     state: str = "UNKNOWN",
 ) -> None:
     payload = {
@@ -881,7 +956,37 @@ def _write_trial_summary(
             float(evaluation_wall_time_sec) if evaluation_wall_time_sec is not None else None
         ),
         "generated_samples": (int(generated_samples) if generated_samples is not None else None),
+        "expected_generated_samples": (
+            int(expected_generated_samples) if expected_generated_samples is not None else None
+        ),
+        "generated_fill_fraction": (
+            float(generated_fill_fraction) if generated_fill_fraction is not None else None
+        ),
         "target_rows": (int(target_rows) if target_rows is not None else None),
+        "last_intermediate": {
+            "stage": str(last_intermediate_stage) if last_intermediate_stage is not None else None,
+            "source_step": (
+                int(last_intermediate_source_step)
+                if last_intermediate_source_step is not None
+                else None
+            ),
+            "report_step": (
+                int(last_intermediate_report_step)
+                if last_intermediate_report_step is not None
+                else None
+            ),
+            "value": (
+                float(last_intermediate_value)
+                if last_intermediate_value is not None
+                else None
+            ),
+            "metric": _json_safe((last_intermediate_metrics or {}).get("pruning_metric")),
+            "metrics": _json_safe(last_intermediate_metrics or {}),
+        },
+        "prune_reason": str(prune_reason) if prune_reason is not None else None,
+        "failure_type": str(failure_type) if failure_type is not None else None,
+        "failure_message": str(failure_message) if failure_message is not None else None,
+        "failure_traceback": str(failure_traceback) if failure_traceback is not None else None,
         "hyperparameters": dict(params),
     }
     trial_path = _trial_summary_path(study_root, int(trial_number))
@@ -953,6 +1058,18 @@ def run_optuna_study(
     )
     with open(study_root / "hpo_target_overlap_diagnostics.json", "w", encoding="utf-8") as handle:
         json.dump(validation_diagnostics.get("hpo_target_overlap", {}), handle, indent=2)
+    with open(study_root / "hpo_runtime_config.json", "w", encoding="utf-8") as handle:
+        json.dump(
+            _json_safe(
+                {
+                    "study_family": study_family,
+                    "hpo_runtime_config": family_hpo_cfg,
+                    "target_rows": int(len(resolved.hpo_target_df)),
+                }
+            ),
+            handle,
+            indent=2,
+        )
 
     sampler_name = str(resolved.step5_hpo.get("sampler", "tpe")).strip().lower()
     if sampler_name != "tpe":
@@ -963,7 +1080,7 @@ def run_optuna_study(
         seed=int(resolved.step5_hpo.get("sampler_seed", 42)),
         n_startup_trials=int(effective_startup_trials),
     )
-    pruner = _build_optuna_pruner(resolved)
+    pruner = _build_optuna_pruner(resolved, study_family=study_family)
     study_name = f"step5_{study_family}_{resolved.c_target}_{resolved.model_size}"
     storage_uri = _storage_uri(resolved, study_family=study_family)
     study = optuna.create_study(
@@ -1001,30 +1118,63 @@ def run_optuna_study(
     trial_wall_time_limit_seconds = _resolve_optional_positive_float(
         family_hpo_cfg.get("trial_wall_time_limit_seconds", None)
     )
-    stage_offsets = {
-        "s2": 0,
-        "warm_start": 1_000_000,
-        "dpo": 2_000_000,
-        "rl": 3_000_000,
-        "sampling": 4_000_000,
-    }
+    hpo_effective_num_rounds = max(1, min(int(hpo_num_rounds), len(hpo_sampling_seeds)))
+    hpo_generation_budget_is_total = bool(
+        resolved.step5.get("preserve_total_generation_across_rounds", False)
+    )
+    expected_hpo_samples = int(
+        len(resolved.hpo_target_df)
+        * int(hpo_generation_budget)
+        * (1 if hpo_generation_budget_is_total else hpo_effective_num_rounds)
+    )
 
     def objective(trial) -> float:
+        report_state: Dict[str, Any] = {
+            "next_report_step": 0,
+            "last_stage": None,
+            "last_source_step": None,
+            "last_report_step": None,
+            "last_value": None,
+            "last_metric": None,
+            "last_metrics": {},
+            "prune_reason": None,
+        }
+
         def pruning_callback(*, stage: str, step: int, value: float, metrics: Dict[str, Any]) -> None:
             if (
                 trial_wall_time_limit_seconds is not None
                 and time.time() - start > float(trial_wall_time_limit_seconds)
             ):
+                report_state["prune_reason"] = "trial_wall_time_limit"
                 raise optuna.TrialPruned(
                     f"Pruned Step 5 {study_family} trial {int(trial.number)} after "
                     f"{float(trial_wall_time_limit_seconds):.1f}s wall-time limit"
                 )
             if not math.isfinite(float(value)):
                 return
-            trial.report(float(value), step=stage_offsets.get(str(stage), 0) + int(step))
+            report_step = int(report_state["next_report_step"])
+            report_state["next_report_step"] = report_step + 1
+            safe_metrics = _json_safe(metrics)
+            report_state.update(
+                {
+                    "last_stage": str(stage),
+                    "last_source_step": int(step),
+                    "last_report_step": int(report_step),
+                    "last_value": float(value),
+                    "last_metric": (
+                        safe_metrics.get("pruning_metric")
+                        if isinstance(safe_metrics, dict)
+                        else None
+                    ),
+                    "last_metrics": safe_metrics,
+                }
+            )
+            trial.report(float(value), step=report_step)
             if trial.should_prune():
+                report_state["prune_reason"] = "optuna_pruner"
                 raise optuna.TrialPruned(
-                    f"Pruned Step 5 {study_family} trial {int(trial.number)} at stage={stage} step={int(step)}"
+                    f"Pruned Step 5 {study_family} trial {int(trial.number)} "
+                    f"at stage={stage} source_step={int(step)} report_step={int(report_step)}"
                 )
 
         run_cfg = deepcopy(base_run_cfg)
@@ -1066,7 +1216,15 @@ def run_optuna_study(
                         "trial_params": params,
                     },
                 )
-        except optuna.TrialPruned:
+        except optuna.TrialPruned as exc:
+            trial.set_user_attr("failure_type", type(exc).__name__)
+            trial.set_user_attr("failure_message", str(exc))
+            trial.set_user_attr("prune_reason", str(report_state.get("prune_reason") or "unknown"))
+            trial.set_user_attr("last_intermediate_stage", report_state.get("last_stage"))
+            trial.set_user_attr("last_intermediate_source_step", report_state.get("last_source_step"))
+            trial.set_user_attr("last_intermediate_report_step", report_state.get("last_report_step"))
+            trial.set_user_attr("last_intermediate_value", report_state.get("last_value"))
+            trial.set_user_attr("last_intermediate_metric", report_state.get("last_metric"))
             _write_trial_summary(
                 study_root,
                 trial_number=int(trial.number),
@@ -1085,10 +1243,28 @@ def run_optuna_study(
                 selection_efficiency_eligible=None,
                 selection_efficiency_notes=None,
                 wall_time_sec=float(time.time() - start),
+                expected_generated_samples=int(expected_hpo_samples),
+                last_intermediate_stage=report_state.get("last_stage"),
+                last_intermediate_source_step=report_state.get("last_source_step"),
+                last_intermediate_report_step=report_state.get("last_report_step"),
+                last_intermediate_value=report_state.get("last_value"),
+                last_intermediate_metrics=report_state.get("last_metrics"),
+                prune_reason=str(report_state.get("prune_reason") or "unknown"),
+                failure_type=type(exc).__name__,
+                failure_message=str(exc),
                 state="PRUNED",
             )
             raise
-        except Exception:
+        except Exception as exc:
+            failure_traceback = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
+            trial.set_user_attr("failure_type", type(exc).__name__)
+            trial.set_user_attr("failure_message", str(exc))
+            trial.set_user_attr("failure_traceback_tail", "\n".join(failure_traceback.splitlines()[-40:]))
+            trial.set_user_attr("last_intermediate_stage", report_state.get("last_stage"))
+            trial.set_user_attr("last_intermediate_source_step", report_state.get("last_source_step"))
+            trial.set_user_attr("last_intermediate_report_step", report_state.get("last_report_step"))
+            trial.set_user_attr("last_intermediate_value", report_state.get("last_value"))
+            trial.set_user_attr("last_intermediate_metric", report_state.get("last_metric"))
             _write_trial_summary(
                 study_root,
                 trial_number=int(trial.number),
@@ -1107,6 +1283,15 @@ def run_optuna_study(
                 selection_efficiency_eligible=None,
                 selection_efficiency_notes=None,
                 wall_time_sec=float(time.time() - start),
+                expected_generated_samples=int(expected_hpo_samples),
+                last_intermediate_stage=report_state.get("last_stage"),
+                last_intermediate_source_step=report_state.get("last_source_step"),
+                last_intermediate_report_step=report_state.get("last_report_step"),
+                last_intermediate_value=report_state.get("last_value"),
+                last_intermediate_metrics=report_state.get("last_metrics"),
+                failure_type=type(exc).__name__,
+                failure_message=str(exc),
+                failure_traceback="\n".join(failure_traceback.splitlines()[-80:]),
                 state="FAIL",
             )
             if torch.cuda.is_available():
@@ -1141,7 +1326,9 @@ def run_optuna_study(
                 stacklevel=2,
             )
             objective_value = float("-inf")
-        trial.report(objective_value, step=9_999_999)
+        final_report_step = int(report_state["next_report_step"])
+        report_state["next_report_step"] = final_report_step + 1
+        trial.report(objective_value, step=final_report_step)
         mean_class_match_acceptance_rate = float(
             metrics.get("mean_class_match_acceptance_rate", float("nan"))
         )
@@ -1153,11 +1340,27 @@ def run_optuna_study(
         evaluation_wall_time_sec = float(metrics.get("evaluation_wall_time_seconds", float("nan")))
         generated_samples = int(metrics.get("generated_samples", len(eval_df)))
         target_rows = int(metrics.get("target_rows", 0))
+        metric_generation_budget = int(metrics.get("generation_budget", hpo_generation_budget))
+        metric_num_rounds = max(
+            1,
+            min(int(metrics.get("num_sampling_rounds", hpo_num_rounds)), len(hpo_sampling_seeds)),
+        )
+        if str(metrics.get("generation_budget_mode", "per_round")) == "total_across_rounds":
+            expected_generated_samples = int(target_rows * metric_generation_budget)
+        else:
+            expected_generated_samples = int(target_rows * metric_generation_budget * metric_num_rounds)
+        generated_fill_fraction = (
+            float(generated_samples) / float(expected_generated_samples)
+            if expected_generated_samples > 0
+            else float("nan")
+        )
         selection_objective_value, selection_efficiency_eligible, selection_efficiency_notes = (
             _compute_selection_objective_value(
                 objective_value=float(objective_value),
                 mean_class_match_acceptance_rate=mean_class_match_acceptance_rate,
                 mean_total_raw_samples_drawn=mean_total_raw_samples_drawn,
+                generated_samples=int(generated_samples),
+                expected_generated_samples=int(expected_generated_samples),
                 hpo_cfg=family_hpo_cfg,
             )
         )
@@ -1192,7 +1395,15 @@ def run_optuna_study(
         trial.set_user_attr("sampling_wall_time_sec", sampling_wall_time_sec)
         trial.set_user_attr("evaluation_wall_time_sec", evaluation_wall_time_sec)
         trial.set_user_attr("generated_samples", int(generated_samples))
+        trial.set_user_attr("expected_generated_samples", int(expected_generated_samples))
+        trial.set_user_attr("generated_fill_fraction", float(generated_fill_fraction))
         trial.set_user_attr("target_rows", int(target_rows))
+        trial.set_user_attr("final_report_step", int(final_report_step))
+        trial.set_user_attr("last_intermediate_stage", report_state.get("last_stage"))
+        trial.set_user_attr("last_intermediate_source_step", report_state.get("last_source_step"))
+        trial.set_user_attr("last_intermediate_report_step", report_state.get("last_report_step"))
+        trial.set_user_attr("last_intermediate_value", report_state.get("last_value"))
+        trial.set_user_attr("last_intermediate_metric", report_state.get("last_metric"))
         trial.set_user_attr("run_name", str(run_cfg["run_name"]))
         _write_trial_summary(
             study_root,
@@ -1216,7 +1427,14 @@ def run_optuna_study(
             sampling_wall_time_sec=sampling_wall_time_sec,
             evaluation_wall_time_sec=evaluation_wall_time_sec,
             generated_samples=int(generated_samples),
+            expected_generated_samples=int(expected_generated_samples),
+            generated_fill_fraction=float(generated_fill_fraction),
             target_rows=int(target_rows),
+            last_intermediate_stage=report_state.get("last_stage"),
+            last_intermediate_source_step=report_state.get("last_source_step"),
+            last_intermediate_report_step=report_state.get("last_report_step"),
+            last_intermediate_value=report_state.get("last_value"),
+            last_intermediate_metrics=report_state.get("last_metrics"),
             state="COMPLETE",
         )
         return objective_value
@@ -1252,7 +1470,17 @@ def run_optuna_study(
             "sampling_wall_time_sec": trial.user_attrs.get("sampling_wall_time_sec"),
             "evaluation_wall_time_sec": trial.user_attrs.get("evaluation_wall_time_sec"),
             "generated_samples": trial.user_attrs.get("generated_samples"),
+            "expected_generated_samples": trial.user_attrs.get("expected_generated_samples"),
+            "generated_fill_fraction": trial.user_attrs.get("generated_fill_fraction"),
             "target_rows": trial.user_attrs.get("target_rows"),
+            "failure_type": trial.user_attrs.get("failure_type"),
+            "failure_message": trial.user_attrs.get("failure_message"),
+            "prune_reason": trial.user_attrs.get("prune_reason"),
+            "last_intermediate_stage": trial.user_attrs.get("last_intermediate_stage"),
+            "last_intermediate_source_step": trial.user_attrs.get("last_intermediate_source_step"),
+            "last_intermediate_report_step": trial.user_attrs.get("last_intermediate_report_step"),
+            "last_intermediate_value": trial.user_attrs.get("last_intermediate_value"),
+            "last_intermediate_metric": trial.user_attrs.get("last_intermediate_metric"),
         }
         for trial in study.trials
     ]
@@ -1356,11 +1584,43 @@ def run_optuna_study(
                 if "generated_samples" in trial.user_attrs
                 else None
             ),
+            "expected_generated_samples": (
+                int(trial.user_attrs["expected_generated_samples"])
+                if "expected_generated_samples" in trial.user_attrs
+                else None
+            ),
+            "generated_fill_fraction": (
+                float(trial.user_attrs["generated_fill_fraction"])
+                if "generated_fill_fraction" in trial.user_attrs
+                else None
+            ),
             "target_rows": (
                 int(trial.user_attrs["target_rows"])
                 if "target_rows" in trial.user_attrs
                 else None
             ),
+            "failure_type": (
+                str(trial.user_attrs["failure_type"])
+                if "failure_type" in trial.user_attrs
+                else None
+            ),
+            "failure_message": (
+                str(trial.user_attrs["failure_message"])
+                if "failure_message" in trial.user_attrs
+                else None
+            ),
+            "prune_reason": (
+                str(trial.user_attrs["prune_reason"])
+                if "prune_reason" in trial.user_attrs
+                else None
+            ),
+            "last_intermediate": {
+                "stage": trial.user_attrs.get("last_intermediate_stage"),
+                "source_step": trial.user_attrs.get("last_intermediate_source_step"),
+                "report_step": trial.user_attrs.get("last_intermediate_report_step"),
+                "value": trial.user_attrs.get("last_intermediate_value"),
+                "metric": trial.user_attrs.get("last_intermediate_metric"),
+            },
             "hyperparameters": dict(trial.params),
         }
         for trial in study.trials
@@ -1423,6 +1683,12 @@ def run_optuna_study(
                     ),
                     "best_generated_samples": int(
                         best_trial.user_attrs.get("generated_samples", 0)
+                    ),
+                    "best_expected_generated_samples": int(
+                        best_trial.user_attrs.get("expected_generated_samples", 0)
+                    ),
+                    "best_generated_fill_fraction": float(
+                        best_trial.user_attrs.get("generated_fill_fraction", float("nan"))
                     ),
                     "best_target_rows": int(best_trial.user_attrs.get("target_rows", 0)),
                     "best_params": dict(best_trial.params),

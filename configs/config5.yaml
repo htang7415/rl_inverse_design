@@ -4,6 +4,8 @@ step5:
   random_seed: 42
   num_sampling_rounds: 5
   sampling_seeds: [42, 43, 44, 45, 46]
+  preserve_total_generation_across_rounds: true
+  s0_use_configured_target_condition: true
   canonical_families: [S0, S1, S2, S3, S4]
   enabled_runs:
     - S0_raw_unconditional
@@ -89,6 +91,8 @@ step5:
     sol_log_prob_floor: -5.0
     w_sol: 1.0
     w_chi: 2.0
+    w_sa: 1.0
+    w_sa_continuous: 0.5
     invalid_reward_penalty: -10.0
     embedding_timestep: 1
 
@@ -103,7 +107,7 @@ step5:
     warmup_steps: 1000
     warmup_schedule: linear
     lr_schedule: constant_after_warmup
-    max_steps: 50000
+    max_steps: 20000
     val_check_interval_steps: 500
     early_stopping_patience_checks: 10
     early_stopping_min_delta: 1.0e-4
@@ -216,7 +220,7 @@ step5:
     lr_schedule: constant_after_warmup
     kl_weight: 0.01
     gradient_checkpointing: true
-    rl_num_steps: 5000
+    rl_num_steps: 2000
     policy_update_epochs: 1
     normalize_advantages: false
     ppo_clip_eps: 0.2
@@ -250,10 +254,21 @@ step5:
       checkpoint_selection_mode_by_class_overrides:
         polyether: proxy_property_success_hit_rate
       proxy_eval_interval_epochs: 2
-      num_epochs: 10
+      num_epochs: 50
       synthetic_candidates_per_target: 16
 
   run_overrides:
+    S0_raw_unconditional:
+      generation_budget: 10000
+      generation_budget_by_class:
+        polyacrylate: 10000
+        polyether: 10000
+        polyamide: 10000
+        polyester: 10000
+        polyimide: 10000
+        polysulfone: 10000
+        polystyrene: 10000
+      preserve_total_generation_across_rounds: false
     S3_conditional_guided:
       canonical_family: S3
       s2:
@@ -335,7 +350,9 @@ step5_hpo:
   sampler: tpe
   sampler_seed: 42
   n_startup_trials: 8
-  pruner: hyperband
+  pruner: median
+  pruner_n_startup_trials: 8
+  pruner_n_warmup_steps: 2
   pruner_min_resource: 1
   pruner_max_resource: auto
   pruner_reduction_factor: 2
@@ -344,7 +361,7 @@ step5_hpo:
   skip_disk_checkpoints: true
   hpo_s2_max_steps: 8000
   hpo_s2_val_checks: 3
-  hpo_rl_num_steps: 32
+  hpo_rl_num_steps: 256
   hpo_rl_proxy_eval_checks: 1
   hpo_sampling_batch_size: 64
   hpo_decode_class_match_sampling_attempts_max: 16
@@ -367,8 +384,15 @@ step5_hpo:
     polystyrene: 48
   hpo_num_rounds: 1
   hpo_sampling_seeds: [101]
+  efficiency_min_class_match_acceptance_rate: 0.02
+  efficiency_min_generated_fraction: 0.75
   method_runtime_overrides:
+    S2:
+      pruner: none
+      enable_sampling_pruning: false
     S3:
+      pruner: none
+      enable_sampling_pruning: false
       hpo_s2_max_steps: 6000
       hpo_s2_val_checks: 3
       hpo_generation_budget: 32
@@ -381,7 +405,11 @@ step5_hpo:
         polysulfone: 48
         polystyrene: 48
     S4_rl:
-      hpo_rl_num_steps: 32
+      pruner: hyperband
+      pruner_min_resource: 2
+      pruner_max_resource: auto
+      pruner_reduction_factor: 3
+      hpo_rl_num_steps: 256
       hpo_rl_proxy_eval_checks: 1
       hpo_s4_trajectories_per_batch: 8
       hpo_s4_replay_batch_size: 8
@@ -395,7 +423,11 @@ step5_hpo:
         polysulfone: 48
         polystyrene: 48
     S4_ppo:
-      hpo_rl_num_steps: 32
+      pruner: hyperband
+      pruner_min_resource: 2
+      pruner_max_resource: auto
+      pruner_reduction_factor: 3
+      hpo_rl_num_steps: 256
       hpo_rl_proxy_eval_checks: 1
       hpo_s4_trajectories_per_batch: 8
       hpo_s4_replay_batch_size: 8
@@ -409,7 +441,11 @@ step5_hpo:
         polysulfone: 48
         polystyrene: 48
     S4_grpo:
-      hpo_rl_num_steps: 32
+      pruner: hyperband
+      pruner_min_resource: 2
+      pruner_max_resource: auto
+      pruner_reduction_factor: 3
+      hpo_rl_num_steps: 256
       hpo_rl_proxy_eval_checks: 1
       hpo_s4_trajectories_per_batch: 8
       hpo_s4_replay_batch_size: 8
@@ -423,6 +459,8 @@ step5_hpo:
         polysulfone: 48
         polystyrene: 48
     S4_dpo:
+      pruner: none
+      enable_sampling_pruning: false
       hpo_generation_budget: 32
       hpo_generation_budget_by_class:
         polyacrylate: 32
@@ -433,16 +471,17 @@ step5_hpo:
         polysulfone: 48
         polystyrene: 48
       hpo_s4_dpo_checkpoint_selection_mode: val_dpo_loss
+      hpo_s4_dpo_num_epochs: 30
       hpo_decode_class_match_max_request_size: 512
       hpo_decode_class_match_max_total_raw_samples: 2048
       hpo_s4_dpo_cfg_scale_min: 1.0
       hpo_s4_dpo_offline_pair_budget_choices: [256, 512]
       hpo_s4_dpo_batch_size_choices: [16, 32]
-      hpo_s4_dpo_num_epochs_choices: [1, 2]
       hpo_s4_dpo_d_water_budget_fraction_choices: [0.3, 0.5]
       hpo_s4_dpo_pair_source_choices: [target_row_synthetic, chi_aware_plus_target_row_synthetic]
       hpo_s4_dpo_synthetic_candidates_per_target_choices: [4, 8]
-      efficiency_min_class_match_acceptance_rate: 0.01
+      efficiency_min_class_match_acceptance_rate: 0.02
+      efficiency_min_generated_fraction: 0.75
   tie_epsilon: 1.0e-4
   method_budgets:
     S1: {n_trials: 50, timeout_hours_medium: 24}

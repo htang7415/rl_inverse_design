@@ -8,6 +8,7 @@ step5:
   random_seed: 42
   num_sampling_rounds: 1
   sampling_seeds: [42]
+  s0_use_configured_target_condition: true
   canonical_families: [S0, S1, S2, S3, S4]
   enabled_runs:
     - S0_raw_unconditional
@@ -87,6 +88,8 @@ step5:
     sol_log_prob_floor: -5.0
     w_sol: 1.0
     w_chi: 2.0
+    w_sa: 1.0
+    w_sa_continuous: 0.5
     invalid_reward_penalty: -10.0
     embedding_timestep: 1
 
@@ -383,7 +386,6 @@ step5_hpo:
       hpo_s4_dpo_cfg_scale_min: 1.0
       hpo_s4_dpo_offline_pair_budget_choices: [64]
       hpo_s4_dpo_batch_size_choices: [16]
-      hpo_s4_dpo_num_epochs_choices: [1]
       hpo_s4_dpo_d_water_budget_fraction_choices: [0.5]
       hpo_s4_dpo_pair_source_choices: [target_row_synthetic]
       hpo_s4_dpo_synthetic_candidates_per_target_choices: [2]

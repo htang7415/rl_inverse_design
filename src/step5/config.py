@@ -333,6 +333,29 @@ def apply_step5_output_suffix(
     )
 
 
+def apply_step5_hpo_output_suffix(
+    resolved: ResolvedStep5Config,
+    *,
+    hpo_root_suffix: str | None,
+) -> ResolvedStep5Config:
+    """Return a resolved config whose Step 5 HPO root has a target suffix."""
+
+    if hpo_root_suffix in {None, "", "null"}:
+        return resolved
+
+    hpo_cfg = deepcopy(resolved.step5_hpo)
+    hpo_cfg["root_suffix"] = str(hpo_root_suffix)
+
+    snapshot = deepcopy(resolved.config_snapshot)
+    snapshot["step5_hpo"] = _as_serializable(hpo_cfg)
+
+    return replace(
+        resolved,
+        step5_hpo=hpo_cfg,
+        config_snapshot=snapshot,
+    )
+
+
 def filter_step5_target_rows_by_condition(
     target_family_df: pd.DataFrame,
     *,
@@ -390,6 +413,7 @@ def apply_step5_target_condition_filter(
     target_temperature: float | None,
     target_phi: float | None,
     atol: float = 1.0e-6,
+    align_hpo_target_df: bool = False,
 ) -> ResolvedStep5Config:
     """Return a resolved config restricted to one target temperature/phi row."""
 
@@ -405,16 +429,23 @@ def apply_step5_target_condition_filter(
     step5_cfg = deepcopy(resolved.step5)
     step5_cfg["target_temperature"] = float(target_temperature)
     step5_cfg["target_phi"] = float(target_phi)
+    hpo_target_rows = target_rows.copy() if align_hpo_target_df else resolved.hpo_target_df
 
     snapshot = deepcopy(resolved.config_snapshot)
     snapshot["step5"] = _as_serializable(step5_cfg)
     derived = snapshot.setdefault("derived", {})
     if isinstance(derived, dict):
         derived["num_target_rows"] = int(len(target_rows))
+        derived["num_active_proxy_target_rows"] = int(len(target_rows))
+        derived["active_proxy_target_source"] = "target_condition_filter_target_rows"
+        derived["num_legacy_validation_proxy_rows"] = int(len(resolved.rl_proxy_df))
+        if align_hpo_target_df:
+            derived["num_hpo_rows"] = int(len(hpo_target_rows))
         derived["target_condition_filter"] = {
             "target_temperature": float(target_temperature),
             "target_phi": float(target_phi),
             "atol": float(atol),
+            "hpo_target_aligned": bool(align_hpo_target_df),
             "matched_target_row_ids": [
                 int(value)
                 for value in target_rows.get("target_row_id", pd.Series(dtype=int)).tolist()
@@ -425,6 +456,7 @@ def apply_step5_target_condition_filter(
         resolved,
         step5=step5_cfg,
         target_family_df=target_rows,
+        hpo_target_df=hpo_target_rows,
         config_snapshot=snapshot,
     )
 
@@ -969,7 +1001,9 @@ def _build_snapshot(
         "step5_hpo": _as_serializable(hpo_cfg),
         "derived": {
             "num_target_rows": int(len(target_family_df)),
-            "num_rl_proxy_rows": int(len(rl_proxy_df)),
+            "num_active_proxy_target_rows": int(len(target_family_df)),
+            "active_proxy_target_source": "target_family_df",
+            "num_legacy_validation_proxy_rows": int(len(rl_proxy_df)),
             "num_hpo_rows": int(len(hpo_target_df)),
             "chi_train_stats": _as_serializable(chi_train_stats),
             "class_support_stats": _as_serializable(class_support_stats),

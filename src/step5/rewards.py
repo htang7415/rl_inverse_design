@@ -13,7 +13,7 @@ from src.step5.evaluation import (
     compute_chi_penalty_from_bounds,
     resolve_effective_chi_bounds,
 )
-from src.utils.chemistry import check_validity
+from src.utils.chemistry import check_validity, compute_sa_score
 
 
 def predict_step4_scores_from_ids(
@@ -106,6 +106,8 @@ def score_guidance_batch(
     w_sol: float,
     w_chi: float,
     invalid_reward_penalty: float,
+    w_sa: float = 0.0,
+    w_sa_continuous: float = 0.0,
 ) -> Dict[str, object]:
     """Score provisional complete sequences for S1 guidance."""
 
@@ -121,9 +123,12 @@ def score_guidance_batch(
     smiles = tokenizer.batch_decode(provisional_ids.detach().cpu().tolist(), skip_special_tokens=True)
 
     valid_mask: List[int] = []
+    sa_scores: List[float] = []
     for smi in smiles:
         is_valid = bool(check_validity(smi))
         valid_mask.append(int(is_valid))
+        sa_value = compute_sa_score(smi) if is_valid else None
+        sa_scores.append(float(sa_value) if sa_value is not None and np.isfinite(sa_value) else float("nan"))
 
     valid_tensor = torch.tensor(valid_mask, dtype=torch.float32)
     valid_frac = float(valid_tensor.mean().item()) if len(valid_tensor) else 0.0
@@ -152,7 +157,32 @@ def score_guidance_batch(
         dtype=torch.float32,
     )
 
-    valid_reward = float(w_sol) * sol_term + float(w_chi) * chi_term
+    c_target = str(target_row.get("c_target", ""))
+    reporting_sa_max = float(evaluator.reporting_sa_thresholds.get(c_target, evaluator.target_sa_max))
+    discovery_sa_max = float(evaluator.discovery_sa_thresholds.get(c_target, reporting_sa_max))
+    sa_threshold = discovery_sa_max if np.isfinite(discovery_sa_max) else reporting_sa_max
+    sa_ok = torch.tensor(
+        [
+            float(np.isfinite(score_value) and np.isfinite(sa_threshold) and score_value <= sa_threshold)
+            for score_value in sa_scores
+        ],
+        dtype=torch.float32,
+    )
+    sa_continuous_values: List[float] = []
+    for score_value in sa_scores:
+        if not np.isfinite(score_value) or not np.isfinite(sa_threshold) or float(sa_threshold) <= 0.0:
+            sa_continuous_values.append(-1.0)
+            continue
+        raw_value = (float(sa_threshold) - float(score_value)) / float(sa_threshold)
+        sa_continuous_values.append(max(-1.0, min(1.0, raw_value)))
+    sa_continuous = torch.tensor(sa_continuous_values, dtype=torch.float32)
+
+    valid_reward = (
+        float(w_sol) * sol_term
+        + float(w_chi) * chi_term
+        + float(w_sa) * sa_ok
+        + float(w_sa_continuous) * sa_continuous
+    )
     invalid_penalty = torch.full_like(valid_reward, float(invalid_reward_penalty))
     reward = torch.where(valid_tensor > 0.0, valid_reward, invalid_penalty)
     return {
@@ -160,6 +190,8 @@ def score_guidance_batch(
         "smiles": smiles,
         "valid_mask": valid_tensor.cpu(),
         "valid_frac": valid_frac,
+        "sa_ok": sa_ok.cpu(),
+        "sa_continuous": sa_continuous.cpu(),
         "oracle_calls_soluble": int(provisional_ids.shape[0]),
         "oracle_calls_chi": int(provisional_ids.shape[0]),
     }

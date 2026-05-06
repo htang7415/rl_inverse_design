@@ -1472,7 +1472,11 @@ def train_s4_dpo_alignment(
                         stage="dpo",
                         step=int(epoch_idx),
                         value=float(proxy_objective_value),
-                        metrics={**history_row, proxy_objective_metric: float(proxy_objective_value)},
+                        metrics={
+                            **history_row,
+                            proxy_objective_metric: float(proxy_objective_value),
+                            "pruning_metric": str(proxy_objective_metric),
+                        },
                     )
         else:
             if pruning_callback is not None and np.isfinite(current_val):
@@ -1480,7 +1484,7 @@ def train_s4_dpo_alignment(
                     stage="dpo",
                     step=int(epoch_idx),
                     value=-float(current_val),
-                    metrics=history_row,
+                    metrics={**history_row, "pruning_metric": "val_dpo_loss"},
                 )
             if current_val < best_checkpoint_metric_value:
                 best_checkpoint_metric_value = float(current_val)

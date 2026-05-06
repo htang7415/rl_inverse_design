@@ -1119,7 +1119,11 @@ def train_s4_rl_alignment(
                     stage="rl",
                     step=int(step_idx),
                     value=float(proxy_objective_value),
-                    metrics={**history_row, proxy_objective_metric: float(proxy_objective_value)},
+                    metrics={
+                        **history_row,
+                        proxy_objective_metric: float(proxy_objective_value),
+                        "pruning_metric": str(proxy_objective_metric),
+                    },
                 )
 
         history_rows.append(history_row)

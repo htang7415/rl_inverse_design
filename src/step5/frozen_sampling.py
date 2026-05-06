@@ -1004,8 +1004,29 @@ def create_constrained_sampler(
 ) -> ConstrainedSampler:
     """Create a Step 5 sampler with shared class-prior settings."""
 
+    sampler = create_raw_step1_sampler(
+        diffusion_model=diffusion_model,
+        tokenizer=tokenizer,
+        resolved=resolved,
+        device=device,
+    )
+    sampler.set_class_token_bias_start_frac(float(resolved.step5.get("class_token_bias_start_frac", 0.0)))
+    if prior.class_token_logit_bias is not None:
+        sampler.set_class_token_logit_bias(prior.class_token_logit_bias)
+    return sampler
+
+
+def create_raw_step1_sampler(
+    *,
+    diffusion_model: DiscreteMaskingDiffusion,
+    tokenizer: PSmilesTokenizer,
+    resolved: ResolvedStep5Config,
+    device: str,
+) -> ConstrainedSampler:
+    """Create the plain Step 1 sampler without Step 5 class-aware priors."""
+
     sampling_cfg = resolved.base_config.get("sampling", {})
-    sampler = ConstrainedSampler(
+    return ConstrainedSampler(
         diffusion_model=diffusion_model,
         tokenizer=tokenizer,
         num_steps=resolve_step5_sampling_num_steps(resolved.step5, resolved.base_config),
@@ -1016,10 +1037,119 @@ def create_constrained_sampler(
         use_constraints=bool(sampling_cfg.get("use_constraints", True)),
         device=device,
     )
-    sampler.set_class_token_bias_start_frac(float(resolved.step5.get("class_token_bias_start_frac", 0.0)))
-    if prior.class_token_logit_bias is not None:
-        sampler.set_class_token_logit_bias(prior.class_token_logit_bias)
-    return sampler
+
+
+def _sample_raw_step1_lengths(
+    *,
+    tokenizer: PSmilesTokenizer,
+    num_samples: int,
+    sampling_cfg: Dict[str, object],
+    source_lengths: Optional[List[int]] = None,
+) -> List[int]:
+    if bool(sampling_cfg.get("variable_length", False)):
+        min_len = int(sampling_cfg.get("variable_length_min_tokens", 12))
+        max_len = int(min(int(tokenizer.max_length), sampling_cfg.get("variable_length_max_tokens", 100)))
+        lengths = [int(np.random.randint(min_len, max_len + 1)) for _ in range(int(num_samples))]
+    elif source_lengths:
+        sampled = np.random.choice(
+            np.asarray(source_lengths, dtype=np.int32),
+            size=int(num_samples),
+            replace=True,
+        )
+        lengths = [int(value) for value in sampled.tolist()]
+    else:
+        lengths = [int(tokenizer.max_length)] * int(num_samples)
+    return [
+        min(int(tokenizer.max_length), max(2, int(length)))
+        for length in lengths
+    ]
+
+
+def sample_raw_step1_unconditional(
+    *,
+    sampler: ConstrainedSampler,
+    tokenizer: PSmilesTokenizer,
+    resolved: ResolvedStep5Config,
+    num_samples: int,
+    show_progress: bool = True,
+    source_lengths: Optional[List[int]] = None,
+) -> Tuple[List[str], Dict[str, object]]:
+    """Sample the Step 1 model directly, without Step 5 class-aware decoding."""
+
+    sampling_start_time = time.perf_counter()
+    sampling_cfg = resolved.base_config.get("sampling", {})
+    lengths = _sample_raw_step1_lengths(
+        tokenizer=tokenizer,
+        num_samples=int(num_samples),
+        sampling_cfg=sampling_cfg,
+        source_lengths=source_lengths,
+    )
+    _, smiles = sampler.sample_batch(
+        num_samples=int(num_samples),
+        seq_length=int(tokenizer.max_length),
+        batch_size=int(sampling_cfg.get("batch_size", 128)),
+        show_progress=show_progress,
+        lengths=lengths,
+    )
+    elapsed_seconds = float(time.perf_counter() - sampling_start_time)
+    return smiles, {
+        "num_samples": int(num_samples),
+        "returned_num_samples": int(len(smiles)),
+        "accepted_num_samples": int(len(smiles)),
+        "remaining_num_samples": max(0, int(num_samples) - int(len(smiles))),
+        "quota_satisfied": bool(len(smiles) >= int(num_samples)),
+        "sampling_mode": "step1_unconditional",
+        "class_aware_decode_constraints_enabled": False,
+        "family_sampling_mode": "none",
+        "family_sampling_scope": "none",
+        "spans_per_sample": 0,
+        "motif_count": 0,
+        "motif_source": None,
+        "backbone_template_enabled": False,
+        "backbone_template_core_count": 0,
+        "backbone_template_source": None,
+        "backbone_template_min_gap_tokens": 0,
+        "backbone_template_terminal_star_anchor": False,
+        "backbone_template_max_core_token_length": 0,
+        "backbone_template_layout": "disabled",
+        "center_min_frac": 0.0,
+        "center_max_frac": 0.0,
+        "length_prior_count": int(len(source_lengths or [])),
+        "length_prior_source": "step1_source_smiles" if source_lengths else None,
+        "length_prior_min_tokens": None,
+        "length_prior_max_tokens": None,
+        "sampled_length_min": int(min(lengths)) if lengths else None,
+        "sampled_length_max": int(max(lengths)) if lengths else None,
+        "sampled_length_mean": float(np.mean(lengths)) if lengths else None,
+        "class_token_bias_enabled": False,
+        "class_token_bias_strength": 0.0,
+        "enforce_class_match": False,
+        "enforce_backbone_class_match": False,
+        "enforce_star_ok_acceptance": False,
+        "reject_duplicate_canonical_acceptance": False,
+        "reject_sidechain_backbone_hybrids": False,
+        "allowed_atomic_symbols": None,
+        "class_match_mode": "disabled",
+        "class_match_sampling_attempts": 0,
+        "class_match_acceptance_rate": 0.0,
+        "class_match_oversampling_ratio": 1.0 if int(num_samples) > 0 else 0.0,
+        "class_match_min_request_size": None,
+        "class_match_max_request_size": None,
+        "class_match_max_total_raw_samples": None,
+        "allow_partial_quota_return": False,
+        "partial_quota_min_fill_ratio": 0.0,
+        "total_raw_samples_drawn": int(num_samples),
+        "accepted_raw_target_class_samples": 0,
+        "class_match_total_wall_time_seconds": elapsed_seconds,
+        "class_match_total_raw_sampling_wall_time_seconds": elapsed_seconds,
+        "class_match_total_filter_wall_time_seconds": 0.0,
+        "class_match_wall_time_seconds_per_raw_draw": (
+            elapsed_seconds / float(num_samples) if int(num_samples) > 0 else None
+        ),
+        "class_match_raw_sampling_wall_time_seconds_per_raw_draw": (
+            elapsed_seconds / float(num_samples) if int(num_samples) > 0 else None
+        ),
+    }
 
 
 def _sample_raw_smiles_with_prior(

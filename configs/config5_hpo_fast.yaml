@@ -114,7 +114,6 @@ step5_hpo:
       hpo_s4_dpo_cfg_scale_min: 1.0
       hpo_s4_dpo_offline_pair_budget_choices: [64, 128]
       hpo_s4_dpo_batch_size_choices: [16]
-      hpo_s4_dpo_num_epochs_choices: [1]
       hpo_s4_dpo_d_water_budget_fraction_choices: [0.5]
       hpo_s4_dpo_pair_source_choices: [target_row_synthetic]
       hpo_s4_dpo_synthetic_candidates_per_target_choices: [2, 4]

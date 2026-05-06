@@ -453,7 +453,7 @@ def train_s2_supervised_run(
                 stage=str(pruning_stage),
                 step=int(global_step),
                 value=-float(current_selection_value),
-                metrics=history_row,
+                metrics={**history_row, "pruning_metric": str(checkpoint_selection_metric)},
             )
 
         current_val = float(val_metrics["val_diffusion_loss"])

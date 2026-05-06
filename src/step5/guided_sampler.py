@@ -54,7 +54,9 @@ class GuidedSampler(ConstrainedSampler):
         sol_log_prob_floor: float,
         w_sol: float,
         w_chi: float,
-        invalid_reward_penalty: float,
+        w_sa: float = 0.0,
+        w_sa_continuous: float = 0.0,
+        invalid_reward_penalty: float = -10.0,
         **kwargs,
     ):
         super().__init__(**kwargs)
@@ -65,6 +67,8 @@ class GuidedSampler(ConstrainedSampler):
         self.sol_log_prob_floor = float(sol_log_prob_floor)
         self.w_sol = float(w_sol)
         self.w_chi = float(w_chi)
+        self.w_sa = float(w_sa)
+        self.w_sa_continuous = float(w_sa_continuous)
         self.invalid_reward_penalty = float(invalid_reward_penalty)
         self.training_oracle_calls_soluble = 0
         self.training_oracle_calls_chi = 0
@@ -207,6 +211,8 @@ class GuidedSampler(ConstrainedSampler):
                     w_sol=self.w_sol,
                     w_chi=self.w_chi,
                     invalid_reward_penalty=self.invalid_reward_penalty,
+                    w_sa=self.w_sa,
+                    w_sa_continuous=self.w_sa_continuous,
                 )
                 self.training_oracle_calls_soluble += int(scored["oracle_calls_soluble"])
                 self.training_oracle_calls_chi += int(scored["oracle_calls_chi"])
@@ -277,7 +283,9 @@ class GuidedConditionalSampler(ConditionalConstrainedSampler):
         sol_log_prob_floor: float,
         w_sol: float,
         w_chi: float,
-        invalid_reward_penalty: float,
+        w_sa: float = 0.0,
+        w_sa_continuous: float = 0.0,
+        invalid_reward_penalty: float = -10.0,
         **kwargs,
     ):
         super().__init__(**kwargs)
@@ -288,6 +296,8 @@ class GuidedConditionalSampler(ConditionalConstrainedSampler):
         self.sol_log_prob_floor = float(sol_log_prob_floor)
         self.w_sol = float(w_sol)
         self.w_chi = float(w_chi)
+        self.w_sa = float(w_sa)
+        self.w_sa_continuous = float(w_sa_continuous)
         self.invalid_reward_penalty = float(invalid_reward_penalty)
         self.training_oracle_calls_soluble = 0
         self.training_oracle_calls_chi = 0
@@ -437,6 +447,8 @@ class GuidedConditionalSampler(ConditionalConstrainedSampler):
                     w_sol=self.w_sol,
                     w_chi=self.w_chi,
                     invalid_reward_penalty=self.invalid_reward_penalty,
+                    w_sa=self.w_sa,
+                    w_sa_continuous=self.w_sa_continuous,
                 )
                 self.training_oracle_calls_soluble += int(scored["oracle_calls_soluble"])
                 self.training_oracle_calls_chi += int(scored["oracle_calls_chi"])

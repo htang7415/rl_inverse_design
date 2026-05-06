@@ -176,7 +176,7 @@ def _prepare_shared_artifacts(resolved, *, config_path: str) -> None:
 
     _write_frame(resolved.target_base_df, metrics_dir / "d_target_base.csv")
     _write_frame(resolved.target_family_df, metrics_dir / "d_target_family.csv")
-    _write_frame(resolved.rl_proxy_df, metrics_dir / "rl_proxy_targets.csv")
+    _write_frame(resolved.rl_proxy_df, metrics_dir / "legacy_validation_proxy_targets.csv")
     if not resolved.hpo_target_df.empty:
         _write_frame(resolved.hpo_target_df, metrics_dir / "d_hpo_family.csv")
     _write_frame(resolved.chi_split_df, metrics_dir / "d_chi_with_split.csv")
@@ -222,7 +222,9 @@ def _prepare_shared_artifacts(resolved, *, config_path: str) -> None:
             "classification_split_mode": resolved.classification_split_mode,
             "model_size": resolved.model_size,
             "num_target_rows": int(len(resolved.target_family_df)),
-            "num_rl_proxy_rows": int(len(resolved.rl_proxy_df)),
+            "num_active_proxy_target_rows": int(len(resolved.target_family_df)),
+            "active_proxy_target_source": "target_family_df",
+            "num_legacy_validation_proxy_rows": int(len(resolved.rl_proxy_df)),
             "num_hpo_rows": int(len(resolved.hpo_target_df)),
             "enabled_runs": resolved.enabled_runs,
             "method_root": str(resolved.method_root),
@@ -318,7 +320,15 @@ def main() -> None:
     parser.add_argument("--prepare_only", action="store_true")
     parser.add_argument("--runs", default=None, help="Comma-separated subset of enabled runs.")
     parser.add_argument("--allow_partial", action="store_true", help="Skip unsupported runs for development.")
-    parser.add_argument("--generation_budget", type=int, default=None, help="Override samples per target row.")
+    parser.add_argument(
+        "--generation_budget",
+        type=int,
+        default=None,
+        help=(
+            "Override samples per target row. When "
+            "step5.preserve_total_generation_across_rounds is true, this is distributed across rounds."
+        ),
+    )
     parser.add_argument("--num_rounds", type=int, default=None, help="Override number of sampling rounds.")
     parser.add_argument(
         "--target_temperature",

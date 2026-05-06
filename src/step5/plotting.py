@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from matplotlib.lines import Line2D
 import matplotlib.pyplot as plt
 from matplotlib.ticker import MaxNLocator, PercentFormatter
 import numpy as np
@@ -205,7 +206,10 @@ def _set_integer_x_axis(ax, values, *, minimum_span: int = 1) -> None:
     lo = min(0, int(np.floor(lo_data)))
     hi = max(int(np.ceil(hi_data)), lo + int(max(1, minimum_span)))
     ax.set_xlim(float(lo), float(hi))
-    ax.set_xticks(np.arange(lo, hi + 1, dtype=int))
+    if hi - lo <= 10:
+        ax.set_xticks(np.arange(lo, hi + 1, dtype=int))
+    else:
+        ax.xaxis.set_major_locator(MaxNLocator(nbins=6, integer=True))
 
 
 def _add_bar_value_labels(ax, bars, values, *, font_size: int, rate: bool = True) -> None:
@@ -269,7 +273,54 @@ def _add_compact_target_labels(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def _run_label(row: pd.Series) -> str:
-    return str(row.get("run_label", row.get("run_name", "")))
+    return _compact_method_label(row.get("run_name", ""), row.get("run_label", None))
+
+
+def _compact_method_label(run_name: object, run_label: object | None = None) -> str:
+    key = f"{run_name} {run_label or ''}".strip().lower()
+    if "s4_dpo" in key or "s4d" in key:
+        return "S4: RL-DPO"
+    if "s4_grpo" in key or "s4g" in key:
+        return "S4: RL-GRPO"
+    if "s4_ppo" in key or "s4p" in key:
+        return "S4: RL-PPO"
+    if "s4_rl" in key or "s4r" in key:
+        return "S4: RL"
+    if "s3" in key:
+        return "S3: Guided conditional"
+    if "s2" in key:
+        return "S2: Conditional"
+    if "s1" in key:
+        return "S1: Guided"
+    if "s0" in key:
+        return "S0: Raw"
+    fallback = str(run_label or run_name).strip()
+    return fallback or "Run"
+
+
+def _gaussian_kde_1d(values: np.ndarray, grid: np.ndarray) -> np.ndarray:
+    values = np.asarray(values, dtype=float)
+    values = values[np.isfinite(values)]
+    grid = np.asarray(grid, dtype=float)
+    if values.size == 0 or grid.size == 0:
+        return np.zeros_like(grid, dtype=float)
+
+    grid_span = float(np.nanmax(grid) - np.nanmin(grid)) if grid.size > 1 else 1.0
+    fallback_bandwidth = max(grid_span * 0.04, 1.0e-3)
+    if values.size < 2:
+        bandwidth = fallback_bandwidth
+    else:
+        std = float(np.nanstd(values, ddof=1))
+        q25, q75 = np.nanpercentile(values, [25, 75])
+        robust_std = float((q75 - q25) / 1.349) if np.isfinite(q75 - q25) and q75 > q25 else std
+        scale = min(std, robust_std) if std > 0.0 and robust_std > 0.0 else max(std, robust_std)
+        bandwidth = 0.9 * scale * float(values.size) ** (-0.2) if scale > 0.0 else fallback_bandwidth
+        bandwidth = max(float(bandwidth), fallback_bandwidth)
+
+    z = (grid[:, None] - values[None, :]) / float(bandwidth)
+    density = np.exp(-0.5 * z * z).sum(axis=1)
+    density /= float(values.size) * float(bandwidth) * np.sqrt(2.0 * np.pi)
+    return density
 
 
 def _add_summary_box(ax, text: str, *, loc: tuple[float, float] = (0.03, 0.97)) -> None:
@@ -505,7 +556,7 @@ def plot_overall_success_all_runs(
     font_size: int = 16,
     dpi: int = 600,
 ) -> None:
-    """Bar chart of mean success hit rate for all compared runs."""
+    """Bar chart of success hit rate; error bars are std across sampling rounds."""
 
     apply_step5_plot_style(font_size=font_size, dpi=dpi)
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -514,8 +565,12 @@ def plot_overall_success_all_runs(
 
     labels = [_run_label(row) for _, row in ordered.iterrows()]
     values = ordered[mean_col].astype(float).to_numpy(dtype=float)
-    errors = ordered[std_col].astype(float).to_numpy(dtype=float) if std_col in ordered.columns else None
-    colors = [_run_color(label, idx) for idx, label in enumerate(labels)]
+    errors = (
+        pd.to_numeric(ordered[std_col], errors="coerce").fillna(0.0).to_numpy(dtype=float)
+        if std_col in ordered.columns
+        else None
+    )
+    colors = [_run_color(row.get("run_name", label), idx) for idx, (label, row) in enumerate(zip(labels, ordered.to_dict(orient="records")))]
 
     fig, ax = plt.subplots(figsize=(_figure_width(len(ordered), base=6.2, per_item=0.55), 4.8))
     bars = ax.bar(
@@ -526,12 +581,12 @@ def plot_overall_success_all_runs(
         edgecolor=_EDGE_COLOR,
         linewidth=0.7,
         alpha=0.92,
-        error_kw={"elinewidth": 0.9, "capthick": 0.9, "capsize": 3, "ecolor": _EDGE_COLOR},
+        error_kw={"elinewidth": 1.1, "capthick": 1.1, "capsize": 4, "ecolor": _EDGE_COLOR},
     )
     ax.set_xlabel("Run")
-    ax.set_ylabel(_metric_axis_label(label))
+    ax.set_ylabel("Success hit rate")
     ax.set_xticks(range(len(ordered)))
-    ax.set_xticklabels(labels, rotation=0)
+    ax.set_xticklabels(labels, rotation=25, ha="right")
     _format_rate_axis(ax, upper=1.08)
     _style_axis(ax, grid_axis="y")
     _add_bar_value_labels(ax, bars, values, font_size=font_size)
@@ -574,7 +629,10 @@ def plot_overall_success_by_family(
         ax.text(
             bar.get_x() + bar.get_width() / 2.0,
             min(float(values[idx]) + 0.025, 1.055),
-            str(ordered.iloc[idx].get("best_run_label", ordered.iloc[idx]["best_run_name"])),
+            _compact_method_label(
+                ordered.iloc[idx].get("best_run_name", ""),
+                ordered.iloc[idx].get("best_run_label", None),
+            ),
             rotation=0,
             ha="center",
             va="bottom",
@@ -715,7 +773,10 @@ def plot_per_target_success_compare(
         sub = sub.sort_values(["temperature", "phi", "target_row_id"])
         xs = [target_positions[int(target_row_id)] for target_row_id in sub["target_row_id"]]
         ys = sub[mean_col].astype(float).tolist()
-        run_display = str(sub["run_label"].iloc[0]) if "run_label" in sub.columns else str(run_name)
+        run_display = _compact_method_label(
+            run_name,
+            str(sub["run_label"].iloc[0]) if "run_label" in sub.columns else None,
+        )
         ax.plot(
             xs,
             ys,
@@ -724,7 +785,7 @@ def plot_per_target_success_compare(
             markersize=4.8,
             alpha=0.92,
             label=run_display,
-            color=_run_color(run_display, idx),
+            color=_run_color(run_name, idx),
             markeredgecolor="white",
             markeredgewidth=0.35,
         )
@@ -823,7 +884,7 @@ def plot_success_gate_funnel_compare(
     if not is_property_metric:
         gates.insert(-2, "class_ok")
 
-    fig, ax = plt.subplots(figsize=(7.6, max(4.5, 0.46 * len(gates) + 1.5)))
+    fig, ax = plt.subplots(figsize=(8.8, max(4.5, 0.46 * len(gates) + 1.5)))
     ordered = run_comparison_df.sort_values([mean_col, "run_name"], ascending=[False, True]).reset_index(drop=True)
     y_pos = np.arange(len(gates), dtype=int)
     for idx, row in ordered.iterrows():
@@ -840,7 +901,7 @@ def plot_success_gate_funnel_compare(
             markersize=4.8,
             alpha=0.92,
             label=run_display,
-            color=_run_color(run_display, idx),
+            color=_run_color(row.get("run_name", run_display), idx),
             markeredgecolor="white",
             markeredgewidth=0.35,
         )
@@ -850,6 +911,7 @@ def plot_success_gate_funnel_compare(
     ax.set_xlabel("Mean pass rate")
     ax.set_ylabel("Screening gate")
     _format_rate_axis(ax, axis="x", upper=1.08)
+    ax.set_xticks([0.0, 0.5, 1.0])
     _style_axis(ax, grid_axis="x")
     legend_cols = 1 if len(ordered) <= 8 else 2
     ax.legend(
@@ -879,36 +941,36 @@ def plot_success_vs_oracle_budget(
     mean_col, _std_col, label = _comparison_success_columns(run_comparison_df)
     ordered = run_comparison_df.sort_values([mean_col, "run_name"], ascending=[False, True]).reset_index(drop=True)
 
-    fig, ax = plt.subplots(figsize=(6.4, 4.8))
-    x = ordered["mean_total_oracle_calls"].astype(float)
-    y = ordered[mean_col].astype(float)
-    labels = [_run_label(row) for _, row in ordered.iterrows()]
-    colors = [_run_color(label, idx) for idx, label in enumerate(labels)]
-    ax.scatter(
-        x,
-        y,
-        s=54,
-        alpha=0.9,
-        color=colors,
-        edgecolors="white",
-        linewidths=0.45,
-        zorder=3,
-    )
+    fig, ax = plt.subplots(figsize=(8.8, 5.2))
     for idx, row in ordered.iterrows():
-        offset = (5, 5 if idx % 2 == 0 else -10)
-        ax.annotate(
-            _run_label(row),
-            (float(row["mean_total_oracle_calls"]), float(row[mean_col])),
-            xytext=offset,
-            textcoords="offset points",
-            fontsize=int(font_size),
-            color=_TEXT_COLOR,
+        run_display = _run_label(row)
+        ax.scatter(
+            float(row["mean_total_oracle_calls"]),
+            float(row[mean_col]),
+            s=64,
+            alpha=0.92,
+            color=_run_color(row.get("run_name", run_display), idx),
+            edgecolors="white",
+            linewidths=0.5,
+            label=run_display,
+            zorder=3,
         )
     ax.set_xlabel("Mean oracle calls")
     ax.set_ylabel(_metric_axis_label(label))
+    ax.margins(x=0.08, y=0.08)
     _format_rate_axis(ax, upper=1.04)
     _style_axis(ax, grid_axis="both")
-    _save_step5_figure(fig, output_path, dpi=dpi)
+    legend_cols = 1 if len(ordered) <= 8 else 2
+    ax.legend(
+        loc="upper left",
+        bbox_to_anchor=(1.01, 1.0),
+        borderaxespad=0.0,
+        fontsize=_legend_font_size(font_size),
+        ncol=legend_cols,
+        handlelength=1.2,
+        columnspacing=0.9,
+    )
+    _save_step5_figure(fig, output_path, dpi=dpi, rect=(0, 0, 0.76, 1))
     plt.close(fig)
 
 
@@ -925,22 +987,28 @@ def plot_supervised_training_curves(
     output_path.parent.mkdir(parents=True, exist_ok=True)
     fig, axes = plt.subplots(1, 2, figsize=(9.6, 3.9), sharex=False)
     ordered = history_df.sort_values(["run_label", "global_step"], kind="mergesort")
+    all_steps = pd.to_numeric(ordered["global_step"], errors="coerce").dropna().to_numpy(dtype=float)
+    step_scale = 1000.0 if all_steps.size and float(np.nanmax(np.abs(all_steps))) >= 1000.0 else 1.0
+    step_label = "Step (k)" if step_scale > 1.0 else "Step"
     run_groups = list(ordered.groupby("run_name", sort=True))
     for idx, (_run_name, sub) in enumerate(run_groups):
-        label = str(sub["run_label"].iloc[0]) if "run_label" in sub.columns else str(_run_name)
-        x = pd.to_numeric(sub["global_step"], errors="coerce").to_numpy(dtype=float)
+        label = _compact_method_label(
+            _run_name,
+            str(sub["run_label"].iloc[0]) if "run_label" in sub.columns else None,
+        )
+        x = pd.to_numeric(sub["global_step"], errors="coerce").to_numpy(dtype=float) / step_scale
         if "train_diffusion_loss_window" in sub.columns:
             y_train = pd.to_numeric(sub["train_diffusion_loss_window"], errors="coerce").to_numpy(dtype=float)
-            axes[0].plot(x, y_train, linewidth=1.6, label=label, color=_run_color(label, idx))
+            axes[0].plot(x, y_train, linewidth=1.6, label=label, color=_run_color(_run_name, idx))
         if "val_diffusion_loss" in sub.columns:
             y_val = pd.to_numeric(sub["val_diffusion_loss"], errors="coerce").to_numpy(dtype=float)
-            axes[1].plot(x, y_val, linewidth=1.6, label=label, color=_run_color(label, idx))
-    axes[0].set_xlabel("Step")
+            axes[1].plot(x, y_val, linewidth=1.6, label=label, color=_run_color(_run_name, idx))
+    axes[0].set_xlabel(step_label)
     axes[0].set_ylabel("Train diffusion loss")
-    axes[1].set_xlabel("Step")
+    axes[1].set_xlabel(step_label)
     axes[1].set_ylabel("Val diffusion loss")
     for ax in axes:
-        ax.xaxis.set_major_locator(MaxNLocator(nbins=5))
+        ax.xaxis.set_major_locator(MaxNLocator(nbins=4))
         ax.yaxis.set_major_locator(MaxNLocator(nbins=5))
         _style_axis(ax, grid_axis="both")
     _add_shared_legend(axes[1], axes, font_size=font_size)
@@ -959,29 +1027,72 @@ def plot_alignment_training_curves(
 
     apply_step5_plot_style(font_size=font_size, dpi=dpi)
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    fig, axes = plt.subplots(2, 2, figsize=(9.8, 7.0), sharex=False)
-    axes_flat = axes.reshape(-1)
-    plot_specs = [
-        ("loss", "Loss"),
-        ("baseline_reward", "Reward"),
-        ("trajectory_kl_mean", "KL"),
-        ("proxy_property_success_hit_rate_discovery", "Proxy success"),
+    metric_candidates = [
+        [("loss", "Loss", False)],
+        [("baseline_reward", "Reward", False), ("reward_mean", "Reward", False)],
+        [("trajectory_kl_mean", "KL", False)],
+        [
+            ("proxy_property_success_hit_rate_discovery", "Proxy success", True),
+            ("proxy_property_success_hit_rate_reporting", "Proxy success", True),
+            ("success_rate", "Rollout success", True),
+        ],
     ]
+    plot_specs: list[tuple[str, str, bool]] = []
+    for candidates in metric_candidates:
+        for column, ylabel, is_rate in candidates:
+            if column not in history_df.columns:
+                continue
+            numeric = pd.to_numeric(history_df[column], errors="coerce")
+            if "run_name" in history_df.columns:
+                curve_counts = (
+                    pd.DataFrame({"run_name": history_df["run_name"], "value": numeric})
+                    .groupby("run_name", dropna=False)["value"]
+                    .apply(lambda values: int(values.notna().sum()))
+                )
+                has_curve = bool(not curve_counts.empty and int(curve_counts.max()) >= 2)
+            else:
+                has_curve = bool(int(numeric.notna().sum()) >= 2)
+            if has_curve:
+                plot_specs.append((column, ylabel, is_rate))
+                break
+    if not plot_specs:
+        return
+
+    ncols = 2 if len(plot_specs) > 1 else 1
+    nrows = int(np.ceil(len(plot_specs) / ncols))
+    fig, axes = plt.subplots(nrows, ncols, figsize=(4.9 * ncols, 3.5 * nrows), sharex=False, squeeze=False)
+    axes_flat = axes.reshape(-1)
+    for ax in axes_flat[len(plot_specs):]:
+        ax.set_visible(False)
+
     ordered = history_df.sort_values(["run_label", "step_idx"], kind="mergesort")
     run_groups = list(ordered.groupby("run_name", sort=True))
+    axis_x_values: list[list[float]] = [[] for _ in plot_specs]
     for idx, (_run_name, sub) in enumerate(run_groups):
-        label = str(sub["run_label"].iloc[0]) if "run_label" in sub.columns else str(_run_name)
+        label = _compact_method_label(
+            _run_name,
+            str(sub["run_label"].iloc[0]) if "run_label" in sub.columns else None,
+        )
         x = pd.to_numeric(sub["step_idx"], errors="coerce").to_numpy(dtype=float)
-        for ax, (column, ylabel) in zip(axes_flat, plot_specs):
-            if column in sub.columns and sub[column].notna().any():
-                y = pd.to_numeric(sub[column], errors="coerce").to_numpy(dtype=float)
-                ax.plot(x, y, linewidth=1.45, label=label, color=_run_color(label, idx))
-            ax.set_xlabel("Step")
-            ax.set_ylabel(ylabel)
-            ax.xaxis.set_major_locator(MaxNLocator(nbins=5))
+        for ax_idx, (column, _ylabel, _is_rate) in enumerate(plot_specs):
+            ax = axes_flat[ax_idx]
+            y = pd.to_numeric(sub[column], errors="coerce").to_numpy(dtype=float)
+            valid_mask = np.isfinite(x) & np.isfinite(y)
+            if not valid_mask.any():
+                continue
+            axis_x_values[ax_idx].extend([float(value) for value in x[valid_mask]])
+            ax.plot(x[valid_mask], y[valid_mask], linewidth=1.45, label=label, color=_run_color(_run_name, idx))
+    for ax_idx, (_column, ylabel, is_rate) in enumerate(plot_specs):
+        ax = axes_flat[ax_idx]
+        ax.set_xlabel("Step")
+        ax.set_ylabel(ylabel)
+        _set_integer_x_axis(ax, axis_x_values[ax_idx], minimum_span=2)
+        if is_rate:
+            _format_rate_axis(ax, upper=1.02)
+        else:
             ax.yaxis.set_major_locator(MaxNLocator(nbins=5))
-            _style_axis(ax, grid_axis="both")
-    _add_shared_legend(axes_flat[-1], axes_flat, font_size=font_size)
+        _style_axis(ax, grid_axis="both")
+    _add_shared_legend(axes_flat[len(plot_specs) - 1], axes_flat[: len(plot_specs)], font_size=font_size)
     _save_step5_figure(fig, output_path, dpi=dpi, rect=(0, 0, 0.84, 1))
     plt.close(fig)
 
@@ -1025,7 +1136,10 @@ def plot_dpo_training_curves(
     run_groups = list(ordered.groupby("run_name", sort=True))
     all_epoch_values: list[float] = []
     for idx, (_run_name, sub) in enumerate(run_groups):
-        label = str(sub["run_label"].iloc[0]) if "run_label" in sub.columns else str(_run_name)
+        label = _compact_method_label(
+            _run_name,
+            str(sub["run_label"].iloc[0]) if "run_label" in sub.columns else None,
+        )
         x = pd.to_numeric(sub["epoch_idx"], errors="coerce").to_numpy(dtype=float)
         all_epoch_values.extend([float(value) for value in x if np.isfinite(value)])
         for ax, (column, ylabel, is_rate) in zip(axes, plot_specs):
@@ -1038,7 +1152,7 @@ def plot_dpo_training_curves(
                     marker=_run_marker(idx),
                     markersize=4.5,
                     label=label,
-                    color=_run_color(label, idx),
+                    color=_run_color(_run_name, idx),
                 )
             ax.set_xlabel("Epoch")
             ax.set_ylabel(ylabel)
@@ -1049,9 +1163,8 @@ def plot_dpo_training_curves(
             _style_axis(ax, grid_axis="both")
     for ax in axes:
         _set_integer_x_axis(ax, all_epoch_values, minimum_span=2)
-    if len(run_groups) > 1:
-        _add_shared_legend(axes[-1], axes, font_size=font_size)
-    _save_step5_figure(fig, output_path, dpi=dpi, rect=(0.02, 0.02, 0.9, 0.98))
+    _add_shared_legend(axes[-1], axes, font_size=font_size)
+    _save_step5_figure(fig, output_path, dpi=dpi, rect=(0.02, 0.02, 0.86, 0.98))
     plt.close(fig)
 
 
@@ -1062,37 +1175,78 @@ def plot_chi_vs_target_compare(
     font_size: int = 16,
     dpi: int = 600,
 ) -> None:
-    """Plot generated chi predictions against target chi across compared runs."""
+    """Plot generated chi-prediction density curves across compared runs."""
 
     apply_step5_plot_style(font_size=font_size, dpi=dpi)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     valid = evaluation_df.loc[
         evaluation_df["chi_pred_target"].notna() & evaluation_df["chi_target"].notna()
     ].copy()
-    fig, ax = plt.subplots(figsize=(6.4, 5.6))
+    valid["chi_pred_target"] = pd.to_numeric(valid["chi_pred_target"], errors="coerce")
+    valid["chi_target"] = pd.to_numeric(valid["chi_target"], errors="coerce")
+    valid = valid.loc[valid["chi_pred_target"].notna() & valid["chi_target"].notna()].copy()
+
+    run_groups = list(valid.groupby("run_name", sort=False)) if not valid.empty else []
+    fig, ax = plt.subplots(figsize=(8.8, 6.2))
+    ax.set_box_aspect(1.0)
     if not valid.empty:
-        run_groups = list(valid.groupby("run_name", sort=True))
+        legend_handles: list[Line2D] = []
+        all_x = pd.concat([valid["chi_pred_target"], valid["chi_target"]], ignore_index=True).to_numpy(dtype=float)
+        all_x = all_x[np.isfinite(all_x)]
+        if all_x.size:
+            x_min = float(np.nanmin(all_x))
+            x_max = float(np.nanmax(all_x))
+        else:
+            x_min, x_max = 0.0, 1.0
+        x_span = max(x_max - x_min, 0.05)
+        x_grid = np.linspace(x_min - 0.12 * x_span, x_max + 0.12 * x_span, 500)
+        ymax = 0.0
         for idx, (_run_name, sub) in enumerate(run_groups):
-            label = str(sub["run_label"].iloc[0]) if "run_label" in sub.columns else str(_run_name)
-            ax.scatter(
-                sub["chi_target"].astype(float),
-                sub["chi_pred_target"].astype(float),
-                s=15,
-                alpha=0.52,
+            run_label = str(sub["run_label"].iloc[0]) if "run_label" in sub.columns else str(_run_name)
+            label = _compact_method_label(_run_name, run_label)
+            color = _run_color(_run_name, idx)
+            values = sub["chi_pred_target"].to_numpy(dtype=float)
+            values = values[np.isfinite(values)]
+            if values.size == 0:
+                continue
+            density = _gaussian_kde_1d(values, x_grid)
+            ymax = max(ymax, float(np.nanmax(density)) if np.isfinite(density).any() else 0.0)
+            ax.plot(
+                x_grid,
+                density,
+                linewidth=2.0,
+                color=color,
                 label=label,
-                color=_run_color(label, idx),
-                edgecolors="white",
-                linewidths=0.2,
                 zorder=2,
             )
-        _apply_parity_axis(ax, valid["chi_target"], valid["chi_pred_target"])
-        corr = _safe_series_correlation(valid["chi_target"], valid["chi_pred_target"])
-        _add_summary_box(
-            ax,
-            f"n={len(valid)}\nr={corr:.3f}" if np.isfinite(corr) else f"n={len(valid)}",
-        )
+            ax.fill_between(x_grid, density, 0.0, color=color, alpha=0.13, linewidth=0.0, zorder=1)
+            legend_handles.append(
+                Line2D(
+                    [0],
+                    [0],
+                    color=color,
+                    marker="o",
+                    markersize=6,
+                    linewidth=2.0,
+                    label=label,
+                )
+            )
+
+        target_values = np.sort(valid["chi_target"].dropna().unique().astype(float))
+        if len(target_values) == 1:
+            target = float(target_values[0])
+            ax.axvline(target, color=_EDGE_COLOR, linewidth=1.1, linestyle=(0, (4, 3)), zorder=1)
+        elif len(target_values) > 1:
+            ax.axvspan(float(target_values.min()), float(target_values.max()), color=_EDGE_COLOR, alpha=0.08, zorder=1)
+
+        ax.set_xlim(float(x_grid[0]), float(x_grid[-1]))
+        ax.set_ylim(0.0, max(1.0e-8, ymax * 1.12))
+        ax.xaxis.set_major_locator(MaxNLocator(nbins=5))
+        ax.yaxis.set_major_locator(MaxNLocator(nbins=5))
+        _style_axis(ax, grid_axis="both")
         legend_cols = 1 if len(run_groups) <= 8 else 2
         ax.legend(
+            handles=legend_handles,
             loc="upper left",
             bbox_to_anchor=(1.01, 1.0),
             borderaxespad=0.0,
@@ -1102,8 +1256,9 @@ def plot_chi_vs_target_compare(
             columnspacing=0.8,
         )
     else:
+        ax.text(0.5, 0.5, "No chi predictions", ha="center", va="center", transform=ax.transAxes)
         _style_axis(ax, grid_axis="both")
-    ax.set_xlabel("Target chi")
-    ax.set_ylabel("Predicted chi")
-    _save_step5_figure(fig, output_path, dpi=dpi, rect=(0, 0, 0.82, 1))
+    ax.set_xlabel("Predicted chi")
+    ax.set_ylabel("Density")
+    _save_step5_figure(fig, output_path, dpi=dpi, rect=(0, 0, 0.76, 1))
     plt.close(fig)

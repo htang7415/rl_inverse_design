@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 from copy import deepcopy
 from pathlib import Path
+import re
 import sys
 from typing import Dict, List
 
@@ -15,6 +16,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from src.step5.config import (
     _deep_merge,
+    apply_step5_hpo_output_suffix,
     apply_step5_output_suffix,
     apply_step5_target_condition_filter,
     load_step5_config,
@@ -36,8 +38,38 @@ def _validate_positive_int(name: str, value: int | None) -> None:
         raise ValueError(f"{name} must be >= 1 when provided.")
 
 
+def _sanitize_condition_value(value: float) -> str:
+    text = str(float(value))
+    text = text.replace("+", "_").replace("-", "m").replace(".", "p")
+    text = re.sub(r"[^A-Za-z0-9_]", "_", text)
+    text = re.sub(r"_+", "_", text).strip("_")
+    return text
+
+
+def _target_condition_suffix(target_temperature: float, target_phi: float) -> str:
+    return f"_T{_sanitize_condition_value(target_temperature)}_phi{_sanitize_condition_value(target_phi)}"
+
+
 def _build_run_cfg_override(args) -> Dict[str, object]:
     override: Dict[str, object] = {}
+    s1_override: Dict[str, object] = {}
+    if args.s1_best_of_k is not None:
+        s1_override["best_of_k"] = int(args.s1_best_of_k)
+    if args.s1_guidance_start_frac is not None:
+        s1_override["guidance_start_frac"] = float(args.s1_guidance_start_frac)
+    if args.s1_w_sol is not None:
+        s1_override["w_sol"] = float(args.s1_w_sol)
+    if args.s1_w_chi is not None:
+        s1_override["w_chi"] = float(args.s1_w_chi)
+    if args.s1_w_sa is not None:
+        s1_override["w_sa"] = float(args.s1_w_sa)
+    if args.s1_w_sa_continuous is not None:
+        s1_override["w_sa_continuous"] = float(args.s1_w_sa_continuous)
+    if args.s1_sol_log_prob_floor is not None:
+        s1_override["sol_log_prob_floor"] = float(args.s1_sol_log_prob_floor)
+    if s1_override:
+        override["s1"] = s1_override
+
     s2_override: Dict[str, object] = {}
     if args.s2_max_steps is not None:
         s2_override["max_steps"] = int(args.s2_max_steps)
@@ -53,14 +85,34 @@ def _build_run_cfg_override(args) -> Dict[str, object]:
         s4_override["rl_num_steps"] = int(args.rl_num_steps)
     if args.rl_proxy_eval_interval_steps is not None:
         s4_override["rl_proxy_eval_interval_steps"] = int(args.rl_proxy_eval_interval_steps)
+    if args.rl_proxy_num_targets is not None:
+        s4_override["rl_proxy_num_targets"] = int(args.rl_proxy_num_targets)
+    if args.rl_proxy_generation_budget is not None:
+        s4_override["rl_proxy_generation_budget"] = int(args.rl_proxy_generation_budget)
     if args.trajectories_per_batch is not None:
         s4_override["trajectories_per_batch"] = int(args.trajectories_per_batch)
     if args.rl_diffusion_num_steps is not None:
         s4_override["rl_diffusion_num_steps"] = int(args.rl_diffusion_num_steps)
     if args.replay_batch_size is not None:
         s4_override["replay_batch_size"] = int(args.replay_batch_size)
+    if args.s4_cfg_scale is not None:
+        s4_override["cfg_scale"] = float(args.s4_cfg_scale)
+
+    dpo_override: Dict[str, object] = {}
     if args.dpo_num_epochs is not None:
-        s4_override["dpo"] = {"num_epochs": int(args.dpo_num_epochs)}
+        dpo_override["num_epochs"] = int(args.dpo_num_epochs)
+    if args.dpo_checkpoint_selection_mode is not None:
+        dpo_override["checkpoint_selection_mode"] = str(args.dpo_checkpoint_selection_mode).strip().lower()
+    if args.dpo_proxy_eval_interval_epochs is not None:
+        dpo_override["proxy_eval_interval_epochs"] = int(args.dpo_proxy_eval_interval_epochs)
+    if args.dpo_beta is not None:
+        dpo_override["beta"] = float(args.dpo_beta)
+    if args.dpo_pair_source is not None:
+        dpo_override["pair_source"] = str(args.dpo_pair_source).strip().lower()
+    if args.dpo_synthetic_candidates_per_target is not None:
+        dpo_override["synthetic_candidates_per_target"] = int(args.dpo_synthetic_candidates_per_target)
+    if dpo_override:
+        s4_override["dpo"] = dpo_override
     if s4_override:
         override["s4"] = s4_override
     return override
@@ -143,21 +195,62 @@ def main() -> None:
         action="store_true",
         help="Reuse the HPO trial runtime caps during best-trial refit.",
     )
-    parser.add_argument("--generation_budget", type=int, default=None, help="Override samples per target row.")
+    parser.add_argument(
+        "--generation_budget",
+        type=int,
+        default=None,
+        help=(
+            "Override samples per target row. When "
+            "step5.preserve_total_generation_across_rounds is true, this is distributed across rounds."
+        ),
+    )
     parser.add_argument("--num_rounds", type=int, default=None, help="Override number of sampling rounds.")
     parser.add_argument("--sampling_seeds", default=None, help="Comma-separated sampling seed override.")
     parser.add_argument("--target_temperature", type=float, default=None, help="Run one exact target temperature.")
     parser.add_argument("--target_phi", type=float, default=None, help="Run one exact target polymer fraction.")
     parser.add_argument("--method_root_suffix", default=None, help="Optional suffix for Step 5 output roots.")
+    parser.add_argument(
+        "--hpo_root_suffix",
+        default=None,
+        help="Optional suffix for the HPO c_target output root. Defaults to method_root_suffix or target condition.",
+    )
+    parser.add_argument("--s1_best_of_k", type=int, default=None)
+    parser.add_argument("--s1_guidance_start_frac", type=float, default=None)
+    parser.add_argument("--s1_w_sol", type=float, default=None)
+    parser.add_argument("--s1_w_chi", type=float, default=None)
+    parser.add_argument("--s1_w_sa", type=float, default=None)
+    parser.add_argument("--s1_w_sa_continuous", type=float, default=None)
+    parser.add_argument("--s1_sol_log_prob_floor", type=float, default=None)
     parser.add_argument("--s2_max_steps", type=int, default=None)
     parser.add_argument("--s2_val_check_interval_steps", type=int, default=None)
     parser.add_argument("--s2_early_stopping_patience_checks", type=int, default=None)
     parser.add_argument("--rl_num_steps", type=int, default=None)
     parser.add_argument("--rl_proxy_eval_interval_steps", type=int, default=None)
+    parser.add_argument("--rl_proxy_num_targets", type=int, default=None)
+    parser.add_argument("--rl_proxy_generation_budget", type=int, default=None)
     parser.add_argument("--trajectories_per_batch", type=int, default=None)
     parser.add_argument("--rl_diffusion_num_steps", type=int, default=None)
     parser.add_argument("--replay_batch_size", type=int, default=None)
+    parser.add_argument("--s4_cfg_scale", type=float, default=None)
     parser.add_argument("--dpo_num_epochs", type=int, default=None)
+    parser.add_argument(
+        "--dpo_checkpoint_selection_mode",
+        choices=["val_dpo_loss", "proxy_property_success_hit_rate"],
+        default=None,
+    )
+    parser.add_argument("--dpo_proxy_eval_interval_epochs", type=int, default=None)
+    parser.add_argument("--dpo_beta", type=float, default=None)
+    parser.add_argument(
+        "--dpo_pair_source",
+        choices=[
+            "label_water_miscibility",
+            "chi_aware_label_bucketed",
+            "target_row_synthetic",
+            "chi_aware_plus_target_row_synthetic",
+        ],
+        default=None,
+    )
+    parser.add_argument("--dpo_synthetic_candidates_per_target", type=int, default=None)
     parser.add_argument("--sampling_batch_size", type=int, default=None)
     parser.add_argument("--class_match_sampling_attempts_max", type=int, default=None)
     parser.add_argument("--class_match_oversample_factor", type=float, default=None)
@@ -168,25 +261,40 @@ def main() -> None:
 
     _validate_positive_int("generation_budget", args.generation_budget)
     _validate_positive_int("num_rounds", args.num_rounds)
+    _validate_positive_int("s1_best_of_k", args.s1_best_of_k)
     _validate_positive_int("s2_max_steps", args.s2_max_steps)
     _validate_positive_int("s2_val_check_interval_steps", args.s2_val_check_interval_steps)
     _validate_positive_int("s2_early_stopping_patience_checks", args.s2_early_stopping_patience_checks)
     _validate_positive_int("rl_num_steps", args.rl_num_steps)
     _validate_positive_int("rl_proxy_eval_interval_steps", args.rl_proxy_eval_interval_steps)
+    _validate_positive_int("rl_proxy_num_targets", args.rl_proxy_num_targets)
+    _validate_positive_int("rl_proxy_generation_budget", args.rl_proxy_generation_budget)
     _validate_positive_int("trajectories_per_batch", args.trajectories_per_batch)
     _validate_positive_int("rl_diffusion_num_steps", args.rl_diffusion_num_steps)
     _validate_positive_int("replay_batch_size", args.replay_batch_size)
     _validate_positive_int("dpo_num_epochs", args.dpo_num_epochs)
+    _validate_positive_int("dpo_proxy_eval_interval_epochs", args.dpo_proxy_eval_interval_epochs)
+    _validate_positive_int("dpo_synthetic_candidates_per_target", args.dpo_synthetic_candidates_per_target)
     _validate_positive_int("sampling_batch_size", args.sampling_batch_size)
     _validate_positive_int("class_match_sampling_attempts_max", args.class_match_sampling_attempts_max)
     _validate_positive_int("class_match_max_request_size", args.class_match_max_request_size)
     _validate_positive_int("class_match_max_total_raw_samples", args.class_match_max_total_raw_samples)
     if (args.target_temperature is None) != (args.target_phi is None):
         raise ValueError("--target_temperature and --target_phi must be provided together.")
+    if args.s1_guidance_start_frac is not None and not (0.0 <= float(args.s1_guidance_start_frac) <= 1.0):
+        raise ValueError("s1_guidance_start_frac must be in [0, 1] when provided.")
+    for name in ("s1_w_sol", "s1_w_chi", "s1_w_sa", "s1_w_sa_continuous"):
+        value = getattr(args, name)
+        if value is not None and float(value) < 0.0:
+            raise ValueError(f"{name} must be >= 0 when provided.")
     if args.class_match_oversample_factor is not None and float(args.class_match_oversample_factor) <= 0.0:
         raise ValueError("class_match_oversample_factor must be > 0 when provided.")
     if args.partial_quota_min_fill_ratio is not None and not (0.0 < float(args.partial_quota_min_fill_ratio) <= 1.0):
         raise ValueError("partial_quota_min_fill_ratio must be in (0, 1] when provided.")
+    if args.s4_cfg_scale is not None and float(args.s4_cfg_scale) <= 0.0:
+        raise ValueError("s4_cfg_scale must be > 0 when provided.")
+    if args.dpo_beta is not None and float(args.dpo_beta) <= 0.0:
+        raise ValueError("dpo_beta must be > 0 when provided.")
 
     resolved = load_step5_config(
         config_path=args.config,
@@ -200,6 +308,12 @@ def main() -> None:
         target_temperature=args.target_temperature,
         target_phi=args.target_phi,
     )
+    hpo_root_suffix = args.hpo_root_suffix
+    if hpo_root_suffix is None:
+        hpo_root_suffix = args.method_root_suffix
+    if hpo_root_suffix is None and args.target_temperature is not None and args.target_phi is not None:
+        hpo_root_suffix = _target_condition_suffix(args.target_temperature, args.target_phi)
+    resolved = apply_step5_hpo_output_suffix(resolved, hpo_root_suffix=hpo_root_suffix)
     resolved = apply_step5_output_suffix(resolved, method_root_suffix=args.method_root_suffix)
     resolved, base_config_override = _apply_base_config_override(resolved, args)
     device = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
