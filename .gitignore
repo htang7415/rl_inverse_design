@@ -19,9 +19,6 @@ experiments*/
 Experiments*/
 
 *.md
-.md
-!README.md
-command.md
 
 *.txt
 *.csv
