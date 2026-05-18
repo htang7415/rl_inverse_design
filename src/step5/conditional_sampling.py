@@ -271,6 +271,7 @@ def create_conditional_sampler(
     sampler.set_class_token_bias_start_frac(float(resolved.step5.get("class_token_bias_start_frac", 0.0)))
     if prior.class_token_logit_bias is not None:
         sampler.set_class_token_logit_bias(prior.class_token_logit_bias)
+    sampler.set_forbidden_tokens(prior.forbidden_tokens)
     return sampler
 
 

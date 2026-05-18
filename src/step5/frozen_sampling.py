@@ -72,6 +72,8 @@ class ResolvedClassSamplingPrior:
     reject_duplicate_canonical_acceptance: bool
     reject_sidechain_backbone_hybrids: bool
     allowed_atomic_symbols: Optional[List[str]]
+    forbidden_tokens: Optional[List[str]]
+    forbidden_token_ids: List[int]
 
 
 class ClassConstrainedSamplingQuotaError(RuntimeError):
@@ -157,7 +159,7 @@ def _resolve_optional_class_int_override(
     return default_value
 
 
-def _normalize_optional_symbol_list(raw_value: object) -> Optional[List[str]]:
+def _normalize_optional_string_list(raw_value: object, *, config_name: str) -> Optional[List[str]]:
     if raw_value is None:
         return None
     if isinstance(raw_value, str) and raw_value.strip().lower() in {"", "null"}:
@@ -168,7 +170,7 @@ def _normalize_optional_symbol_list(raw_value: object) -> Optional[List[str]]:
         tokens = [str(token).strip() for token in raw_value if str(token).strip()]
     else:
         raise ValueError(
-            "decode constraint allowed atomic symbol overrides must be null, a comma-delimited string, or a list"
+            f"{config_name} must be null, a comma-delimited string, or a list"
         )
     if not tokens:
         return None
@@ -180,6 +182,13 @@ def _normalize_optional_symbol_list(raw_value: object) -> Optional[List[str]]:
         seen.add(token)
         normalized.append(token)
     return normalized
+
+
+def _normalize_optional_symbol_list(raw_value: object) -> Optional[List[str]]:
+    return _normalize_optional_string_list(
+        raw_value,
+        config_name="decode constraint allowed atomic symbol overrides",
+    )
 
 
 def _resolve_optional_class_symbol_list_override(
@@ -196,6 +205,81 @@ def _resolve_optional_class_symbol_list_override(
             continue
         return _normalize_optional_symbol_list(raw_value)
     return default_value
+
+
+def _resolve_optional_class_string_list_override(
+    raw_overrides: object,
+    *,
+    target_class: str,
+    default_value: Optional[List[str]],
+    config_name: str,
+) -> Optional[List[str]]:
+    if not isinstance(raw_overrides, dict):
+        return default_value
+    for raw_key, raw_value in raw_overrides.items():
+        key = str(raw_key).strip().lower()
+        if key != str(target_class).strip().lower():
+            continue
+        return _normalize_optional_string_list(raw_value, config_name=config_name)
+    return default_value
+
+
+def _prepare_forbidden_token_ids(
+    tokenizer: PSmilesTokenizer,
+    forbidden_tokens: Optional[List[str]],
+) -> List[int]:
+    if not forbidden_tokens:
+        return []
+    seen: set[int] = set()
+    token_ids: List[int] = []
+    for token in forbidden_tokens:
+        token_id = tokenizer.vocab.get(str(token))
+        if token_id is None:
+            continue
+        token_id = int(token_id)
+        if token_id in seen:
+            continue
+        seen.add(token_id)
+        token_ids.append(token_id)
+    return token_ids
+
+
+def _resolve_forbidden_tokens_from_step5_cfg(
+    step5_cfg: Dict[str, object],
+    *,
+    target_class: str,
+) -> Optional[List[str]]:
+    forbidden_tokens_default = _normalize_optional_string_list(
+        step5_cfg.get("decode_constraint_forbidden_tokens"),
+        config_name="decode constraint forbidden tokens",
+    )
+    return _resolve_optional_class_string_list_override(
+        step5_cfg.get("decode_constraint_forbidden_tokens_overrides", {}),
+        target_class=target_class,
+        default_value=forbidden_tokens_default,
+        config_name="decode constraint forbidden token overrides",
+    )
+
+
+def _resolve_base_config_forbidden_tokens(
+    base_config: Dict[str, object],
+    *,
+    target_class: str,
+) -> Optional[List[str]]:
+    chi_cfg = base_config.get("chi_training", {})
+    step5_cfg = (
+        chi_cfg.get("step5_inverse_design", {})
+        if isinstance(chi_cfg, dict) and isinstance(chi_cfg.get("step5_inverse_design", {}), dict)
+        else {}
+    )
+    if not step5_cfg and isinstance(chi_cfg, dict):
+        legacy_step5_cfg = chi_cfg.get("step5_class_inverse_design", {})
+        if isinstance(legacy_step5_cfg, dict):
+            step5_cfg = legacy_step5_cfg
+    return _resolve_forbidden_tokens_from_step5_cfg(
+        step5_cfg,
+        target_class=target_class,
+    )
 
 
 def _prepare_decode_constraint_token_ids(
@@ -718,6 +802,11 @@ def resolve_class_sampling_prior(
         target_class=target_class,
         default_value=allowed_atomic_symbols_default,
     )
+    forbidden_tokens = _resolve_forbidden_tokens_from_step5_cfg(
+        step5_cfg,
+        target_class=target_class,
+    )
+    forbidden_token_ids = _prepare_forbidden_token_ids(tokenizer, forbidden_tokens)
     family_sampling_scope = _normalize_family_sampling_scope(
         step5_cfg.get("decode_constraint_family_sampling_scope", "final_only")
     )
@@ -871,6 +960,8 @@ def resolve_class_sampling_prior(
         reject_duplicate_canonical_acceptance=bool(reject_duplicate_canonical_acceptance),
         reject_sidechain_backbone_hybrids=bool(reject_sidechain_backbone_hybrids),
         allowed_atomic_symbols=list(allowed_atomic_symbols) if allowed_atomic_symbols else None,
+        forbidden_tokens=list(forbidden_tokens) if forbidden_tokens else None,
+        forbidden_token_ids=forbidden_token_ids,
     )
 
     if metrics_dir is not None:
@@ -939,6 +1030,8 @@ def resolve_class_sampling_prior(
                     "reject_duplicate_canonical_acceptance": bool(prior.reject_duplicate_canonical_acceptance),
                     "reject_sidechain_backbone_hybrids": bool(prior.reject_sidechain_backbone_hybrids),
                     "allowed_atomic_symbols": prior.allowed_atomic_symbols,
+                    "forbidden_tokens": prior.forbidden_tokens,
+                    "forbidden_token_ids": prior.forbidden_token_ids,
                 },
                 handle,
                 indent=2,
@@ -1013,6 +1106,7 @@ def create_constrained_sampler(
     sampler.set_class_token_bias_start_frac(float(resolved.step5.get("class_token_bias_start_frac", 0.0)))
     if prior.class_token_logit_bias is not None:
         sampler.set_class_token_logit_bias(prior.class_token_logit_bias)
+    sampler.set_forbidden_tokens(prior.forbidden_tokens)
     return sampler
 
 
@@ -1026,7 +1120,7 @@ def create_raw_step1_sampler(
     """Create the plain Step 1 sampler without Step 5 class-aware priors."""
 
     sampling_cfg = resolved.base_config.get("sampling", {})
-    return ConstrainedSampler(
+    sampler = ConstrainedSampler(
         diffusion_model=diffusion_model,
         tokenizer=tokenizer,
         num_steps=resolve_step5_sampling_num_steps(resolved.step5, resolved.base_config),
@@ -1037,6 +1131,13 @@ def create_raw_step1_sampler(
         use_constraints=bool(sampling_cfg.get("use_constraints", True)),
         device=device,
     )
+    sampler.set_forbidden_tokens(
+        _resolve_base_config_forbidden_tokens(
+            resolved.base_config,
+            target_class=resolved.c_target,
+        )
+    )
+    return sampler
 
 
 def _sample_raw_step1_lengths(
@@ -1129,6 +1230,11 @@ def sample_raw_step1_unconditional(
         "reject_duplicate_canonical_acceptance": False,
         "reject_sidechain_backbone_hybrids": False,
         "allowed_atomic_symbols": None,
+        "forbidden_tokens": _resolve_base_config_forbidden_tokens(
+            resolved.base_config,
+            target_class=resolved.c_target,
+        ),
+        "forbidden_token_ids": sorted(getattr(sampler, "forbidden_token_ids", set())),
         "class_match_mode": "disabled",
         "class_match_sampling_attempts": 0,
         "class_match_acceptance_rate": 0.0,
@@ -1268,10 +1374,27 @@ def _unexpected_atomic_symbols(
         return []
 
 
+def _contains_forbidden_token(
+    smiles: str,
+    *,
+    tokenizer: PSmilesTokenizer,
+    forbidden_tokens: Optional[List[str]],
+) -> bool:
+    if not forbidden_tokens:
+        return False
+    forbidden = {str(token) for token in forbidden_tokens}
+    try:
+        return any(token in forbidden for token in tokenizer.tokenize(str(smiles)))
+    except Exception:
+        smiles_str = str(smiles)
+        return any(token in smiles_str for token in forbidden)
+
+
 def _accepted_target_class_indices(
     smiles_list: List[str],
     *,
     prior: ResolvedClassSamplingPrior,
+    tokenizer: PSmilesTokenizer,
     classifier: Optional[PolymerClassifier],
     seen_canonical_smiles: set[str],
 ) -> tuple[List[int], Dict[str, int]]:
@@ -1282,6 +1405,7 @@ def _accepted_target_class_indices(
         "star_filter_rejected_count": 0,
         "sidechain_backbone_hybrid_rejected_count": 0,
         "unexpected_atoms_rejected_count": 0,
+        "forbidden_token_rejected_count": 0,
         "duplicate_canonical_rejected_count": 0,
     }
     for idx, smiles in enumerate(smiles_list):
@@ -1324,6 +1448,13 @@ def _accepted_target_class_indices(
             if unexpected_symbols:
                 stats["unexpected_atoms_rejected_count"] += 1
                 continue
+        if _contains_forbidden_token(
+            smiles_str,
+            tokenizer=tokenizer,
+            forbidden_tokens=prior.forbidden_tokens,
+        ):
+            stats["forbidden_token_rejected_count"] += 1
+            continue
         canonical_smiles = canonicalize_smiles(smiles_str) if valid_ok else None
         if (
             prior.reject_duplicate_canonical_acceptance
@@ -1414,6 +1545,8 @@ def _build_class_sampling_metadata(
         "reject_duplicate_canonical_acceptance": bool(prior.reject_duplicate_canonical_acceptance),
         "reject_sidechain_backbone_hybrids": bool(prior.reject_sidechain_backbone_hybrids),
         "allowed_atomic_symbols": list(prior.allowed_atomic_symbols) if prior.allowed_atomic_symbols else None,
+        "forbidden_tokens": list(prior.forbidden_tokens) if prior.forbidden_tokens else None,
+        "forbidden_token_ids": [int(token_id) for token_id in prior.forbidden_token_ids],
         "family_sampling_mode": str(prior.family_sampling_mode),
         "family_sampling_scope": str(prior.family_sampling_scope),
         "spans_per_sample": int(prior.spans_per_sample),
@@ -1642,6 +1775,7 @@ def sample_with_class_prior(
     This decode path is shared by frozen and conditional samplers, so family-aware
     template/scaffold changes here affect every final-generation Step 5 method.
     """
+    sampler.set_forbidden_tokens(prior.forbidden_tokens)
     accepted_smiles: List[str] = []
     accepted_raw_count = 0
     total_drawn = 0
@@ -1658,6 +1792,7 @@ def sample_with_class_prior(
         "star_filter_rejected_count": 0,
         "sidechain_backbone_hybrid_rejected_count": 0,
         "unexpected_atoms_rejected_count": 0,
+        "forbidden_token_rejected_count": 0,
         "duplicate_canonical_rejected_count": 0,
     }
     sampling_start_time = time.perf_counter()
@@ -1771,6 +1906,7 @@ def sample_with_class_prior(
             accepted_idx, attempt_filter_stats = _accepted_target_class_indices(
                 raw_smiles,
                 prior=prior,
+                tokenizer=tokenizer,
                 classifier=classifier,
                 seen_canonical_smiles=seen_canonical_smiles,
             )
@@ -1784,6 +1920,7 @@ def sample_with_class_prior(
             accepted_idx, attempt_filter_stats = _accepted_target_class_indices(
                 raw_smiles,
                 prior=prior,
+                tokenizer=tokenizer,
                 classifier=classifier,
                 seen_canonical_smiles=seen_canonical_smiles,
             )
@@ -1827,6 +1964,9 @@ def sample_with_class_prior(
                 ),
                 "unexpected_atoms_rejected_in_attempt": int(
                     attempt_filter_stats.get("unexpected_atoms_rejected_count", 0)
+                ),
+                "forbidden_token_rejected_in_attempt": int(
+                    attempt_filter_stats.get("forbidden_token_rejected_count", 0)
                 ),
                 "duplicate_canonical_rejected_in_attempt": int(
                     attempt_filter_stats.get("duplicate_canonical_rejected_count", 0)

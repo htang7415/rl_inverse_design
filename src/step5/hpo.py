@@ -776,10 +776,18 @@ def _trial_tie_break_key(trial, *, tie_epsilon: float) -> tuple:
     )
 
 
-def _select_best_completed_trial(study, *, tie_epsilon: float):
+def _select_best_completed_trial(study, *, tie_epsilon: float, prefer_efficiency_eligible: bool = True):
     completed = [trial for trial in study.trials if trial.state == optuna.trial.TrialState.COMPLETE and trial.value is not None]
     if not completed:
         raise ValueError("No completed Optuna trials are available for Step 5 HPO.")
+    if prefer_efficiency_eligible:
+        eligible = [
+            trial
+            for trial in completed
+            if bool(trial.user_attrs.get("selection_efficiency_eligible", True))
+        ]
+        if eligible:
+            completed = eligible
     effective_values = [
         float(trial.user_attrs.get("selection_objective_value", trial.value))
         for trial in completed
@@ -1447,7 +1455,13 @@ def run_optuna_study(
             catch=(RuntimeError, ValueError),
         )
     try:
-        best_trial = _select_best_completed_trial(study, tie_epsilon=tie_epsilon)
+        best_trial = _select_best_completed_trial(
+            study,
+            tie_epsilon=tie_epsilon,
+            prefer_efficiency_eligible=bool(
+                family_hpo_cfg.get("prefer_efficiency_eligible_trials", True)
+            ),
+        )
     except ValueError:
         best_trial = None
 

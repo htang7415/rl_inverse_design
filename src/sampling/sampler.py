@@ -50,6 +50,7 @@ class ConstrainedSampler:
         self.device = device
         self.class_token_logit_bias: Optional[torch.Tensor] = None
         self.class_token_bias_start_frac: float = 0.0
+        self.forbidden_token_ids: set[int] = set()
 
         # Get special token IDs
         self.mask_id = tokenizer.mask_token_id
@@ -101,6 +102,25 @@ class ConstrainedSampler:
             raise ValueError(f"class_token_bias_start_frac must be in [0, 1], got {start_frac}")
         self.class_token_bias_start_frac = start_frac
 
+    def set_forbidden_token_ids(self, token_ids: Optional[Sequence[int]]) -> None:
+        """Set token IDs that must never be sampled at mutable positions."""
+        vocab_size = int(self.tokenizer.vocab_size)
+        self.forbidden_token_ids = {
+            int(token_id)
+            for token_id in (token_ids or [])
+            if 0 <= int(token_id) < vocab_size
+        }
+        self.fallback_non_star_id = self._resolve_fallback_non_star_id()
+
+    def set_forbidden_tokens(self, tokens: Optional[Sequence[str]]) -> None:
+        """Set tokenizer strings that must never be sampled at mutable positions."""
+        token_ids = [
+            int(self.tokenizer.vocab[str(token)])
+            for token in (tokens or [])
+            if str(token) in self.tokenizer.vocab
+        ]
+        self.set_forbidden_token_ids(token_ids)
+
     def _class_token_bias_scale(self, step_progress: float) -> float:
         """Linearly ramp class-token bias from ``start_frac`` to the final step."""
         if self.class_token_logit_bias is None:
@@ -137,6 +157,7 @@ class ConstrainedSampler:
         """Choose a stable fallback token ID that is not special and not '*'."""
         preferred = self.tokenizer.vocab.get('C', -1)
         forbidden = {self.star_id, self.mask_id, self.pad_id, self.bos_id, self.eos_id}
+        forbidden.update(getattr(self, "forbidden_token_ids", set()))
         if preferred >= 0 and preferred not in forbidden:
             return int(preferred)
 
@@ -156,6 +177,8 @@ class ConstrainedSampler:
         Returns None when no valid replacement is available.
         """
         candidate = pos_logits.clone()
+        forbidden_tokens = set(forbidden_tokens)
+        forbidden_tokens.update(getattr(self, "forbidden_token_ids", set()))
         vocab_size = candidate.shape[0]
         for tok in forbidden_tokens:
             if 0 <= tok < vocab_size:
@@ -270,9 +293,16 @@ class ConstrainedSampler:
         logits: torch.Tensor,
         current_ids: torch.Tensor
     ) -> torch.Tensor:
-        """Forbid special tokens from being sampled at MASK positions."""
+        """Forbid special and configured tokens from being sampled at MASK positions."""
         is_masked = current_ids == self.mask_id
-        for tok in [self.mask_id, self.pad_id, self.bos_id, self.eos_id]:
+        forbidden_tokens = [
+            self.mask_id,
+            self.pad_id,
+            self.bos_id,
+            self.eos_id,
+            *sorted(getattr(self, "forbidden_token_ids", set())),
+        ]
+        for tok in forbidden_tokens:
             if tok >= 0:
                 logits[:, :, tok].masked_fill_(is_masked, float('-inf'))
         return logits

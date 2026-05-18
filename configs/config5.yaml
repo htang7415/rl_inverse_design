@@ -226,9 +226,13 @@ step5:
     ppo_clip_eps: 0.2
     grpo_group_size: 8
     grpo_advantage_epsilon: 1.0e-6
-    rl_proxy_eval_interval_steps: 1000
+    rl_proxy_eval_interval_steps: 100
     rl_proxy_num_targets: 5
     rl_proxy_generation_budget: 64
+    rl_min_train_fill_ratio: 0.50
+    rl_partial_rollout_stop_attempt_frac: 0.50
+    rl_low_fill_stop_ratio: 0.25
+    rl_low_fill_patience: 3
     trajectories_per_batch: 48
     replay_batch_size: 16
     dpo:
@@ -386,6 +390,7 @@ step5_hpo:
   hpo_sampling_seeds: [101]
   efficiency_min_class_match_acceptance_rate: 0.02
   efficiency_min_generated_fraction: 0.75
+  prefer_efficiency_eligible_trials: true
   method_runtime_overrides:
     S2:
       pruner: none

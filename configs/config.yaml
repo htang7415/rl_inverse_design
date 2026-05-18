@@ -339,6 +339,8 @@ chi_training:
       polysulfone: ["C", "O", "S", "*"]
       polyacrylate: ["C", "N", "O", "*"]
       polystyrene: ["C", "N", "O", "*"]
+    decode_constraint_forbidden_tokens: ["[15N+]"]  # Step 5 only: suppress isotopic charged nitrogen token during sampling and acceptance
+    decode_constraint_forbidden_tokens_overrides: {}
     decode_constraint_use_class_length_prior: true  # Step 5 only: sample token lengths from local target-class polymers when available
     decode_constraint_length_prior_max_tokens_overrides:
       polyimide: 29

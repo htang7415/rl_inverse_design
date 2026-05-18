@@ -313,6 +313,7 @@ def _create_trajectory_sampler(
     sampler.set_class_token_bias_start_frac(float(resolved.step5.get("class_token_bias_start_frac", 0.0)))
     if prior.class_token_logit_bias is not None:
         sampler.set_class_token_logit_bias(prior.class_token_logit_bias)
+    sampler.set_forbidden_tokens(prior.forbidden_tokens)
     return sampler
 
 
@@ -327,6 +328,8 @@ def _sample_on_policy_rollouts(
     cfg_scale: float,
     num_steps: int,
     device: str,
+    min_train_fill_ratio: float,
+    partial_stop_attempt_fraction: float,
 ) -> Tuple[pd.DataFrame, List[str], List, Dict[str, object]]:
     """Sample one accepted rollout per prompt row while preserving prompt alignment."""
 
@@ -335,9 +338,27 @@ def _sample_on_policy_rollouts(
     accepted_smiles: List[str] = []
     accepted_trajectories: List = []
     accepted_raw_count = 0
+    accepted_prompt_aligned_count = 0
     total_drawn = 0
     attempts = 0
     seen_canonical_smiles: set[str] = set()
+    max_attempts = max(1, int(prior.class_match_sampling_attempts_max))
+    requested_count = int(len(prompt_df))
+    train_fill_ratio = min(max(float(min_train_fill_ratio), 0.0), 1.0)
+    min_training_accepts = max(1, int(np.ceil(float(max(1, requested_count)) * train_fill_ratio)))
+    partial_stop_attempt = max(
+        1,
+        int(np.ceil(float(max_attempts) * min(max(float(partial_stop_attempt_fraction), 0.0), 1.0))),
+    )
+    stopped_at_trainable_partial = False
+    filter_rejection_counts = {
+        "target_class_candidate_count": 0,
+        "star_filter_rejected_count": 0,
+        "sidechain_backbone_hybrid_rejected_count": 0,
+        "unexpected_atoms_rejected_count": 0,
+        "forbidden_token_rejected_count": 0,
+        "duplicate_canonical_rejected_count": 0,
+    }
     # Preserve the shared DiT family constraints in the rollout sampler, but keep
     # prompt-level class acceptance in this function so batch size stays aligned
     # with the prompt dataframe. The generic class-quota helper can oversample
@@ -352,27 +373,20 @@ def _sample_on_policy_rollouts(
 
     while not pending_prompt_df.empty:
         attempts += 1
-        if attempts > int(prior.class_match_sampling_attempts_max):
+        if attempts > max_attempts:
             if _quota_shortfall_is_tolerable(
                 prior=prior,
                 accepted_count=len(accepted_smiles),
-                requested_count=len(prompt_df),
+                requested_count=requested_count,
             ):
                 break
-            # RL can safely continue with a slightly underfilled rollout batch because
-            # reward computation, replay slicing, and GRPO grouping all operate on the
-            # realized accepted rows rather than assuming a fixed batch size.
-            relaxed_training_fill_ratio = min(
-                max(float(prior.partial_quota_min_fill_ratio), 0.0),
-                0.90,
-            )
-            min_training_accepts = int(np.ceil(float(len(prompt_df)) * relaxed_training_fill_ratio))
-            if len(accepted_smiles) >= max(1, min_training_accepts):
+            if len(accepted_smiles) >= min_training_accepts:
+                stopped_at_trainable_partial = True
                 break
             raise RuntimeError(
                 "Step 5 on-policy sampling could not satisfy the target-class quota. "
-                f"target_class={prior.target_class!r} accepted={len(accepted_smiles)} requested={len(prompt_df)} "
-                f"after {int(prior.class_match_sampling_attempts_max)} attempts."
+                f"target_class={prior.target_class!r} accepted={len(accepted_smiles)} requested={requested_count} "
+                f"after {max_attempts} attempts."
             )
         remaining = int(len(pending_prompt_df))
         request_size_total, request_debug = _resolve_class_match_request_size(
@@ -421,11 +435,22 @@ def _sample_on_policy_rollouts(
             accepted_idx, _attempt_filter_stats = _accepted_target_class_indices(
                 raw_smiles,
                 prior=prior,
+                tokenizer=tokenizer,
                 classifier=classifier,
                 seen_canonical_smiles=local_seen_canonical_smiles,
             )
         else:
-            accepted_idx = list(range(len(raw_smiles)))
+            local_seen_canonical_smiles = set(seen_canonical_smiles)
+            accepted_idx, _attempt_filter_stats = _accepted_target_class_indices(
+                raw_smiles,
+                prior=prior,
+                tokenizer=tokenizer,
+                classifier=classifier,
+                seen_canonical_smiles=local_seen_canonical_smiles,
+            )
+        for key, value in _attempt_filter_stats.items():
+            filter_rejection_counts[key] = int(filter_rejection_counts.get(key, 0)) + int(value)
+        accepted_raw_count += int(len(accepted_idx))
 
         chosen_raw_idx: List[int] = []
         chosen_pending_idx: List[int] = []
@@ -441,7 +466,7 @@ def _sample_on_policy_rollouts(
             if canonical_smiles:
                 seen_canonical_smiles.add(canonical_smiles)
 
-        accepted_raw_count += int(len(chosen_raw_idx))
+        accepted_prompt_aligned_count += int(len(chosen_raw_idx))
         if chosen_raw_idx:
             accepted_prompt_parts.append(pending_prompt_df.iloc[chosen_pending_idx].copy())
             accepted_smiles.extend([raw_smiles[idx] for idx in chosen_raw_idx])
@@ -461,54 +486,67 @@ def _sample_on_policy_rollouts(
                 **request_debug,
             }
         )
+        if (
+            not pending_prompt_df.empty
+            and len(accepted_smiles) >= min_training_accepts
+            and attempts >= partial_stop_attempt
+        ):
+            stopped_at_trainable_partial = True
+            break
 
     accepted_prompt_df = (
         pd.concat(accepted_prompt_parts, ignore_index=True).reset_index(drop=True)
         if accepted_prompt_parts
         else prompt_df.iloc[:0].copy()
     )
+    effective_attempts = min(int(attempts), int(max_attempts))
+    fill_fraction = float(len(accepted_smiles)) / float(requested_count) if requested_count > 0 else 1.0
     metadata = {
-        "num_samples": int(len(prompt_df)),
+        "num_samples": int(requested_count),
         "returned_num_samples": int(len(accepted_smiles)),
-        "remaining_num_samples": max(0, int(len(prompt_df)) - int(len(accepted_smiles))),
-        "quota_satisfied": bool(len(accepted_smiles) == len(prompt_df)),
+        "remaining_num_samples": max(0, int(requested_count) - int(len(accepted_smiles))),
+        "fill_fraction": float(fill_fraction),
+        "quota_satisfied": bool(len(accepted_smiles) == requested_count),
         "quota_shortfall_tolerated": bool(
-            len(accepted_smiles) < len(prompt_df)
+            len(accepted_smiles) < requested_count
             and _quota_shortfall_is_tolerable(
                 prior=prior,
                 accepted_count=len(accepted_smiles),
-                requested_count=len(prompt_df),
+                requested_count=requested_count,
             )
         ),
         "quota_shortfall_relaxed_for_training": bool(
-            len(accepted_smiles) < len(prompt_df)
-            and len(prompt_df) > 0
-            and len(accepted_smiles)
-            >= max(
-                1,
-                int(
-                    np.ceil(
-                        float(len(prompt_df))
-                        * min(max(float(prior.partial_quota_min_fill_ratio), 0.0), 0.90)
-                    )
-                ),
-            )
+            len(accepted_smiles) < requested_count
+            and requested_count > 0
+            and len(accepted_smiles) >= min_training_accepts
             and not _quota_shortfall_is_tolerable(
                 prior=prior,
                 accepted_count=len(accepted_smiles),
-                requested_count=len(prompt_df),
+                requested_count=requested_count,
             )
         ),
+        "quota_shortfall_trainable": bool(
+            len(accepted_smiles) < requested_count and len(accepted_smiles) >= min_training_accepts
+        ),
+        "stopped_at_trainable_partial": bool(stopped_at_trainable_partial),
+        "min_train_fill_ratio": float(train_fill_ratio),
+        "min_training_accepts": int(min_training_accepts),
+        "partial_stop_attempt": int(partial_stop_attempt),
         "num_trajectory_batches": int(len(accepted_trajectories)),
         "total_raw_samples_drawn": int(total_drawn),
         "accepted_raw_target_class_samples": int(accepted_raw_count),
-        "class_match_sampling_attempts": int(attempts),
+        "accepted_prompt_aligned_samples": int(accepted_prompt_aligned_count),
+        "class_match_sampling_attempts": int(effective_attempts),
         "class_match_acceptance_rate": (
             float(accepted_raw_count) / float(total_drawn) if total_drawn > 0 else 0.0
         ),
         "class_match_oversampling_ratio": (
-            float(total_drawn) / float(len(prompt_df)) if len(prompt_df) > 0 else 0.0
+            float(total_drawn) / float(requested_count) if requested_count > 0 else 0.0
         ),
+        "filter_rejection_counts": {
+            str(key): int(value)
+            for key, value in filter_rejection_counts.items()
+        },
         "spans_per_sample": int(prior.spans_per_sample),
         "motif_count": int(len(prior.motifs)),
         "motif_source": prior.motif_source,
@@ -848,16 +886,27 @@ def train_s4_rl_alignment(
     grpo_group_size = int(s4_cfg.get("grpo_group_size", 4))
     grpo_advantage_epsilon = float(s4_cfg.get("grpo_advantage_epsilon", 1.0e-6))
     replay_batch_size = int(s4_cfg.get("replay_batch_size", 0) or 0)
+    min_train_fill_ratio = min(max(float(s4_cfg.get("rl_min_train_fill_ratio", 0.50)), 0.0), 1.0)
+    partial_stop_attempt_fraction = min(
+        max(float(s4_cfg.get("rl_partial_rollout_stop_attempt_frac", 0.50)), 0.0),
+        1.0,
+    )
+    low_fill_stop_ratio = min(max(float(s4_cfg.get("rl_low_fill_stop_ratio", 0.25)), 0.0), 1.0)
+    low_fill_patience = max(0, int(s4_cfg.get("rl_low_fill_patience", 3)))
+    consecutive_low_fill_steps = 0
     append_log_message(
         run_dirs["run_dir"],
         (
             f"RL train start | run={run_cfg['run_name']} mode={alignment_mode} "
             f"rl_num_steps={int(s4_cfg['rl_num_steps'])} policy_update_epochs={int(policy_update_epochs)} "
-            f"prompt_source={str(s4_cfg['rl_prompt_source'])}"
+            f"prompt_source={str(s4_cfg['rl_prompt_source'])} "
+            f"min_train_fill_ratio={float(min_train_fill_ratio):.3f}"
         ),
         echo=True,
     )
 
+    completed_steps = 0
+    stop_reason: Optional[str] = None
     for step_idx in range(1, int(s4_cfg["rl_num_steps"]) + 1):
         prompt_df = _sample_rollout_prompt_rows(
             prompt_source_df,
@@ -875,6 +924,8 @@ def train_s4_rl_alignment(
             cfg_scale=float(s4_cfg["cfg_scale"]),
             num_steps=int(rl_diffusion_num_steps),
             device=device,
+            min_train_fill_ratio=float(min_train_fill_ratio),
+            partial_stop_attempt_fraction=float(partial_stop_attempt_fraction),
         )
 
         rollout_df = _build_rollout_frame(
@@ -1058,6 +1109,14 @@ def train_s4_rl_alignment(
                 "class_match_oversampling_ratio": float(
                     rollout_meta.get("class_match_oversampling_ratio", float("nan"))
                 ),
+                "rollout_fill_fraction": float(rollout_meta.get("fill_fraction", float("nan"))),
+                "quota_satisfied": int(bool(rollout_meta.get("quota_satisfied", False))),
+                "quota_shortfall_trainable": int(bool(rollout_meta.get("quota_shortfall_trainable", False))),
+                "stopped_at_trainable_partial": int(bool(rollout_meta.get("stopped_at_trainable_partial", False))),
+                "min_training_accepts": int(rollout_meta.get("min_training_accepts", 0)),
+                "accepted_prompt_aligned_samples": int(
+                    rollout_meta.get("accepted_prompt_aligned_samples", len(evaluation_df))
+                ),
                 "total_raw_samples_drawn": int(rollout_meta.get("total_raw_samples_drawn", len(evaluation_df))),
                 "rl_diffusion_num_steps": int(rl_diffusion_num_steps),
                 "motif_count": int(rollout_meta.get("motif_count", 0)),
@@ -1069,7 +1128,8 @@ def train_s4_rl_alignment(
         should_eval_proxy = (
             checkpoint_mode == "proxy_property_success_hit_rate"
             and (
-                step_idx % int(s4_cfg["rl_proxy_eval_interval_steps"]) == 0
+                step_idx == 1
+                or step_idx % int(s4_cfg["rl_proxy_eval_interval_steps"]) == 0
                 or step_idx == int(s4_cfg["rl_num_steps"])
             )
         )
@@ -1136,10 +1196,36 @@ def train_s4_rl_alignment(
                 f"step={int(step_idx)}/{int(s4_cfg['rl_num_steps'])} "
                 f"rollout_batch={int(len(evaluation_df))} reward={float(history_row['baseline_reward']):.4f} "
                 f"loss={float(history_row['loss']):.4f} proxy={proxy_text} "
-                f"lr={float(history_row['learning_rate']):.4g}"
+                f"lr={float(history_row['learning_rate']):.4g} "
+                f"fill={float(history_row['rollout_fill_fraction']):.3f}"
             ),
             echo=True,
         )
+        completed_steps = int(step_idx)
+        rollout_fill_fraction = float(history_row.get("rollout_fill_fraction", float("nan")))
+        if (
+            low_fill_patience > 0
+            and np.isfinite(rollout_fill_fraction)
+            and rollout_fill_fraction < float(low_fill_stop_ratio)
+        ):
+            consecutive_low_fill_steps += 1
+        else:
+            consecutive_low_fill_steps = 0
+        if low_fill_patience > 0 and consecutive_low_fill_steps >= int(low_fill_patience):
+            stop_reason = (
+                "low_rollout_fill_fraction:"
+                f"{rollout_fill_fraction:.4f}<{float(low_fill_stop_ratio):.4f}"
+                f"_for_{int(consecutive_low_fill_steps)}_steps"
+            )
+            append_log_message(
+                run_dirs["run_dir"],
+                (
+                    f"RL early stop | run={run_cfg['run_name']} mode={alignment_mode} "
+                    f"step={int(step_idx)} reason={stop_reason}"
+                ),
+                echo=True,
+            )
+            break
 
     if not skip_disk_checkpoints:
         _save_rl_checkpoint(
@@ -1148,7 +1234,7 @@ def train_s4_rl_alignment(
             reference_checkpoint_path=warm_start.checkpoint_path,
             optimizer=optimizer,
             scheduler=scheduler,
-            step_idx=int(s4_cfg["rl_num_steps"]),
+            step_idx=int(completed_steps),
             best_proxy_metric_value=best_proxy_success,
             alignment_mode=alignment_mode,
             run_cfg=run_cfg,
@@ -1194,6 +1280,9 @@ def train_s4_rl_alignment(
                 "last_checkpoint_path": (None if skip_disk_checkpoints else str(last_checkpoint_path)),
                 "num_history_rows": int(len(history_df)),
                 "num_proxy_evals": int(len(proxy_history_df)),
+                "steps_completed": int(len(history_df)),
+                "configured_steps": int(s4_cfg["rl_num_steps"]),
+                "stop_reason": stop_reason,
                 "policy_update_epochs": int(policy_update_epochs),
                 "ppo_clip_eps": (float(clip_eps) if alignment_mode in {"ppo", "grpo"} else None),
                 "grpo_group_size": (int(grpo_group_size) if alignment_mode == "grpo" else None),
@@ -1208,6 +1297,7 @@ def train_s4_rl_alignment(
         (
             f"RL train complete | run={run_cfg['run_name']} mode={alignment_mode} "
             f"steps_completed={int(len(history_df))} best_proxy={float(best_proxy_success):.4f}"
+            + (f" stop_reason={stop_reason}" if stop_reason else "")
         ),
         echo=True,
     )
