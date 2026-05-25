@@ -370,22 +370,31 @@ def _sample_on_policy_rollouts(
     )
     classifier = PolymerClassifier(patterns=resolved.polymer_patterns) if prior.enforce_class_match else None
     last_raw_meta: Dict[str, object] = {}
+    stopped_at_quota_exhaustion_partial = False
+    quota_exhaustion_reason: Optional[str] = None
 
     while not pending_prompt_df.empty:
         attempts += 1
         if attempts > max_attempts:
+            accepted_count = int(len(accepted_smiles))
             if _quota_shortfall_is_tolerable(
                 prior=prior,
-                accepted_count=len(accepted_smiles),
+                accepted_count=accepted_count,
                 requested_count=requested_count,
             ):
+                quota_exhaustion_reason = "max_attempts_partial_quota_tolerated"
                 break
-            if len(accepted_smiles) >= min_training_accepts:
+            if accepted_count >= min_training_accepts:
                 stopped_at_trainable_partial = True
+                quota_exhaustion_reason = "max_attempts_trainable_partial"
+                break
+            if accepted_count > 0:
+                stopped_at_quota_exhaustion_partial = True
+                quota_exhaustion_reason = "max_attempts_partial_below_min_train_fill"
                 break
             raise RuntimeError(
                 "Step 5 on-policy sampling could not satisfy the target-class quota. "
-                f"target_class={prior.target_class!r} accepted={len(accepted_smiles)} requested={requested_count} "
+                f"target_class={prior.target_class!r} accepted={accepted_count} requested={requested_count} "
                 f"after {max_attempts} attempts."
             )
         remaining = int(len(pending_prompt_df))
@@ -492,6 +501,7 @@ def _sample_on_policy_rollouts(
             and attempts >= partial_stop_attempt
         ):
             stopped_at_trainable_partial = True
+            quota_exhaustion_reason = "partial_stop_attempt_trainable_partial"
             break
 
     accepted_prompt_df = (
@@ -528,7 +538,13 @@ def _sample_on_policy_rollouts(
         "quota_shortfall_trainable": bool(
             len(accepted_smiles) < requested_count and len(accepted_smiles) >= min_training_accepts
         ),
+        "quota_shortfall_below_min_train": bool(
+            len(accepted_smiles) < requested_count
+            and 0 < len(accepted_smiles) < min_training_accepts
+        ),
         "stopped_at_trainable_partial": bool(stopped_at_trainable_partial),
+        "stopped_at_quota_exhaustion_partial": bool(stopped_at_quota_exhaustion_partial),
+        "quota_exhaustion_reason": quota_exhaustion_reason,
         "min_train_fill_ratio": float(train_fill_ratio),
         "min_training_accepts": int(min_training_accepts),
         "partial_stop_attempt": int(partial_stop_attempt),
@@ -1112,7 +1128,13 @@ def train_s4_rl_alignment(
                 "rollout_fill_fraction": float(rollout_meta.get("fill_fraction", float("nan"))),
                 "quota_satisfied": int(bool(rollout_meta.get("quota_satisfied", False))),
                 "quota_shortfall_trainable": int(bool(rollout_meta.get("quota_shortfall_trainable", False))),
+                "quota_shortfall_below_min_train": int(
+                    bool(rollout_meta.get("quota_shortfall_below_min_train", False))
+                ),
                 "stopped_at_trainable_partial": int(bool(rollout_meta.get("stopped_at_trainable_partial", False))),
+                "stopped_at_quota_exhaustion_partial": int(
+                    bool(rollout_meta.get("stopped_at_quota_exhaustion_partial", False))
+                ),
                 "min_training_accepts": int(rollout_meta.get("min_training_accepts", 0)),
                 "accepted_prompt_aligned_samples": int(
                     rollout_meta.get("accepted_prompt_aligned_samples", len(evaluation_df))
