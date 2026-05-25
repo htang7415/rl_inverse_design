@@ -583,7 +583,7 @@ def plot_overall_success_all_runs(
         alpha=0.92,
         error_kw={"elinewidth": 1.1, "capthick": 1.1, "capsize": 4, "ecolor": _EDGE_COLOR},
     )
-    ax.set_xlabel("Run")
+    ax.set_xlabel("")
     ax.set_ylabel("Success hit rate")
     ax.set_xticks(range(len(ordered)))
     ax.set_xticklabels(labels, rotation=25, ha="right")

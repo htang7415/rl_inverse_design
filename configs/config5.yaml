@@ -220,7 +220,7 @@ step5:
     lr_schedule: constant_after_warmup
     kl_weight: 0.01
     gradient_checkpointing: true
-    rl_num_steps: 2000
+    rl_num_steps: 500
     policy_update_epochs: 1
     normalize_advantages: false
     ppo_clip_eps: 0.2
@@ -321,6 +321,15 @@ step5:
         cfg_scale: 2.0
     S4_rl_finetuned:
       canonical_family: S4
+      generation_budget: 200
+      generation_budget_by_class:
+        polyacrylate: 200
+        polyether: 200
+        polyamide: 200
+        polyester: 200
+        polyimide: 200
+        polysulfone: 200
+        polystyrene: 200
       s4:
         normalize_advantages: true
     S4_dpo:
@@ -329,6 +338,15 @@ step5:
         alignment_mode: dpo
     S4_ppo:
       canonical_family: S4
+      generation_budget: 200
+      generation_budget_by_class:
+        polyacrylate: 200
+        polyether: 200
+        polyamide: 200
+        polyester: 200
+        polyimide: 200
+        polysulfone: 200
+        polystyrene: 200
       s4:
         alignment_mode: ppo
         policy_update_epochs: 2
@@ -336,6 +354,15 @@ step5:
         ppo_clip_eps: 0.2
     S4_grpo:
       canonical_family: S4
+      generation_budget: 200
+      generation_budget_by_class:
+        polyacrylate: 200
+        polyether: 200
+        polyamide: 200
+        polyester: 200
+        polyimide: 200
+        polysulfone: 200
+        polystyrene: 200
       s4:
         alignment_mode: grpo
         policy_update_epochs: 2
