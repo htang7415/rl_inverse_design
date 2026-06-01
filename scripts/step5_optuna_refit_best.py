@@ -257,6 +257,22 @@ def main() -> None:
     parser.add_argument("--class_match_max_request_size", type=int, default=None)
     parser.add_argument("--class_match_max_total_raw_samples", type=int, default=None)
     parser.add_argument("--partial_quota_min_fill_ratio", type=float, default=None)
+    parser.add_argument(
+        "--reuse_s4_checkpoint_path",
+        default=None,
+        help="Load an existing S4 rl/ppo/grpo aligned checkpoint and run sampling only.",
+    )
+    parser.add_argument(
+        "--reuse_s4_run_dir",
+        default=None,
+        help="Load an existing S4 aligned checkpoint from this run directory and run sampling only.",
+    )
+    parser.add_argument(
+        "--reuse_s4_checkpoint_mode",
+        choices=["best", "last"],
+        default="best",
+        help="Checkpoint filename mode used with --reuse_s4_run_dir.",
+    )
     args = parser.parse_args()
 
     _validate_positive_int("generation_budget", args.generation_budget)
@@ -340,6 +356,11 @@ def main() -> None:
         extra_context["sampling_seeds_override"] = sampling_seeds
     if args.method_root_suffix:
         extra_context["method_root_suffix"] = str(args.method_root_suffix)
+    if args.reuse_s4_checkpoint_path:
+        extra_context["reuse_s4_checkpoint_path"] = str(args.reuse_s4_checkpoint_path)
+    if args.reuse_s4_run_dir:
+        extra_context["reuse_s4_run_dir"] = str(args.reuse_s4_run_dir)
+        extra_context["reuse_s4_checkpoint_mode"] = str(args.reuse_s4_checkpoint_mode)
 
     for study_family in requested:
         result = refit_best_trial(

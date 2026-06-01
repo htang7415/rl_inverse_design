@@ -406,6 +406,22 @@ def main() -> None:
         help="Keep temporary checkpoints in memory only during testing.",
     )
     parser.add_argument(
+        "--reuse_s4_checkpoint_path",
+        default=None,
+        help="Load an existing S4 rl/ppo/grpo aligned checkpoint and run sampling only.",
+    )
+    parser.add_argument(
+        "--reuse_s4_run_dir",
+        default=None,
+        help="Load an existing S4 aligned checkpoint from this run directory and run sampling only.",
+    )
+    parser.add_argument(
+        "--reuse_s4_checkpoint_mode",
+        choices=["best", "last"],
+        default="best",
+        help="Checkpoint filename mode used with --reuse_s4_run_dir.",
+    )
+    parser.add_argument(
         "--no_figures",
         action="store_true",
         help="Skip figure generation for faster smoke tests.",
@@ -491,6 +507,11 @@ def main() -> None:
     extra_context = {}
     if args.skip_disk_checkpoints:
         extra_context["skip_disk_checkpoints"] = True
+    if args.reuse_s4_checkpoint_path:
+        extra_context["reuse_s4_checkpoint_path"] = str(args.reuse_s4_checkpoint_path)
+    if args.reuse_s4_run_dir:
+        extra_context["reuse_s4_run_dir"] = str(args.reuse_s4_run_dir)
+        extra_context["reuse_s4_checkpoint_mode"] = str(args.reuse_s4_checkpoint_mode)
     if args.max_target_rows is not None:
         extra_context["max_target_rows"] = int(args.max_target_rows)
     if args.target_temperature is not None and args.target_phi is not None:

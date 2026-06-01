@@ -4,7 +4,7 @@ step5:
   random_seed: 42
   num_sampling_rounds: 5
   sampling_seeds: [42, 43, 44, 45, 46]
-  preserve_total_generation_across_rounds: true
+  preserve_total_generation_across_rounds: false
   s0_use_configured_target_condition: true
   canonical_families: [S0, S1, S2, S3, S4]
   enabled_runs:
@@ -29,15 +29,15 @@ step5:
       - S4_ppo
       - S4_grpo
       - S4_dpo
-  generation_budget: 512
+  generation_budget: 100
   generation_budget_by_class:
-    polyacrylate: 1024
-    polyether: 1024
-    polyamide: 1024
-    polyester: 1024
-    polyimide: 1024
-    polysulfone: 1024
-    polystyrene: 1024
+    polyacrylate: 100
+    polyether: 100
+    polyamide: 100
+    polyester: 100
+    polyimide: 100
+    polysulfone: 100
+    polystyrene: 100
   sampling_temperature: 1.0
   inference_batch_size: 128
   raw_generation_valid_only: false
@@ -220,7 +220,7 @@ step5:
     lr_schedule: constant_after_warmup
     kl_weight: 0.01
     gradient_checkpointing: true
-    rl_num_steps: 500
+    rl_num_steps: 200
     policy_update_epochs: 1
     normalize_advantages: false
     ppo_clip_eps: 0.2
@@ -321,15 +321,16 @@ step5:
         cfg_scale: 2.0
     S4_rl_finetuned:
       canonical_family: S4
-      generation_budget: 200
+      generation_budget: 100
       generation_budget_by_class:
-        polyacrylate: 200
-        polyether: 200
-        polyamide: 200
-        polyester: 200
-        polyimide: 200
-        polysulfone: 200
-        polystyrene: 200
+        polyacrylate: 100
+        polyether: 100
+        polyamide: 100
+        polyester: 100
+        polyimide: 100
+        polysulfone: 100
+        polystyrene: 100
+      preserve_total_generation_across_rounds: false
       s4:
         normalize_advantages: true
     S4_dpo:
@@ -338,15 +339,16 @@ step5:
         alignment_mode: dpo
     S4_ppo:
       canonical_family: S4
-      generation_budget: 200
+      generation_budget: 100
       generation_budget_by_class:
-        polyacrylate: 200
-        polyether: 200
-        polyamide: 200
-        polyester: 200
-        polyimide: 200
-        polysulfone: 200
-        polystyrene: 200
+        polyacrylate: 100
+        polyether: 100
+        polyamide: 100
+        polyester: 100
+        polyimide: 100
+        polysulfone: 100
+        polystyrene: 100
+      preserve_total_generation_across_rounds: false
       s4:
         alignment_mode: ppo
         policy_update_epochs: 2
@@ -354,15 +356,16 @@ step5:
         ppo_clip_eps: 0.2
     S4_grpo:
       canonical_family: S4
-      generation_budget: 200
+      generation_budget: 100
       generation_budget_by_class:
-        polyacrylate: 200
-        polyether: 200
-        polyamide: 200
-        polyester: 200
-        polyimide: 200
-        polysulfone: 200
-        polystyrene: 200
+        polyacrylate: 100
+        polyether: 100
+        polyamide: 100
+        polyester: 100
+        polyimide: 100
+        polysulfone: 100
+        polystyrene: 100
+      preserve_total_generation_across_rounds: false
       s4:
         alignment_mode: grpo
         policy_update_epochs: 2

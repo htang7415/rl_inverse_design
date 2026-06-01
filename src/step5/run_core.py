@@ -469,6 +469,45 @@ def _resolve_reusable_s2_artifact_paths(
     return checkpoint_path, metrics_dir
 
 
+def _resolve_reusable_s4_checkpoint_path(
+    *,
+    run_cfg: Dict[str, object],
+    extra_context: Optional[Dict[str, Any]],
+) -> Optional[Path]:
+    context = extra_context or {}
+    checkpoint_raw = str(context.get("reuse_s4_checkpoint_path", "") or "").strip()
+    if checkpoint_raw:
+        return Path(checkpoint_raw)
+
+    run_dir_raw = str(context.get("reuse_s4_run_dir", "") or "").strip()
+    if not run_dir_raw:
+        return None
+
+    mode = str(context.get("reuse_s4_checkpoint_mode", "best") or "best").strip().lower()
+    if mode not in {"best", "last"}:
+        raise ValueError("reuse_s4_checkpoint_mode must be one of {'best', 'last'}.")
+    alignment_mode = str(run_cfg.get("s4", {}).get("alignment_mode", "")).strip().lower()
+    if alignment_mode not in {"rl", "ppo", "grpo"}:
+        raise ValueError("reuse_s4_run_dir is supported only for S4 rl/ppo/grpo runs.")
+    return Path(run_dir_raw) / "checkpoints" / f"aligned_{alignment_mode}_{mode}.pt"
+
+
+def _load_s4_aligned_checkpoint_for_sampling(
+    *,
+    checkpoint_path: Path,
+    policy_model: torch.nn.Module,
+    device: str,
+) -> Dict[str, Any]:
+    if not checkpoint_path.exists():
+        raise FileNotFoundError(f"Reusable S4 aligned checkpoint not found: {checkpoint_path}")
+    return load_step5_checkpoint_into_modules(
+        checkpoint_path=checkpoint_path,
+        diffusion_model=policy_model,
+        aux_heads=None,
+        device=device,
+    )
+
+
 def _prepare_s4_warm_start(
     *,
     resolved,
@@ -955,33 +994,73 @@ def execute_step5_run(
             warm_start_artifacts.tokenizer,
             metrics_dir=run_dirs["metrics_dir"],
         )
-        if evaluator is None:
-            evaluator = load_step5_evaluator(resolved, device=device)
-        rl_artifacts = train_s4_rl_alignment(
-            resolved=resolved,
+        reuse_s4_checkpoint_path = _resolve_reusable_s4_checkpoint_path(
             run_cfg=run_cfg,
-            run_dirs=run_dirs,
-            warm_start=warm_start_artifacts,
-            prior=prior,
-            evaluator=evaluator,
-            device=device,
-            target_rows_df=target_rows_df,
-            skip_disk_checkpoints=skip_disk_checkpoints,
-            pruning_callback=pruning_callback,
+            extra_context=extra_context,
         )
-        tokenizer = rl_artifacts.tokenizer
-        diffusion_model = rl_artifacts.policy_model
-        s2_scaler = rl_artifacts.scaler
-        _write_json(
-            {
-                "warm_start_run_name": warm_run_cfg["run_name"],
-                "warm_start_dir": str(warm_dirs["run_dir"]),
-                "warm_start_best_checkpoint": (None if skip_disk_checkpoints else str(warm_start_artifacts.checkpoint_path)),
-                "aligned_best_checkpoint": (None if skip_disk_checkpoints else str(rl_artifacts.checkpoint_path)),
-                "disk_checkpoints_saved": bool(not skip_disk_checkpoints),
-            },
-            run_dirs["metrics_dir"] / "s4_alignment_summary.json",
-        )
+        if reuse_s4_checkpoint_path is not None:
+            checkpoint_payload = _load_s4_aligned_checkpoint_for_sampling(
+                checkpoint_path=reuse_s4_checkpoint_path,
+                policy_model=warm_start_artifacts.diffusion_model,
+                device=device,
+            )
+            tokenizer = warm_start_artifacts.tokenizer
+            diffusion_model = warm_start_artifacts.diffusion_model
+            append_log_message(
+                run_dirs["run_dir"],
+                (
+                    f"S4 sampling-only checkpoint loaded | run={run_cfg['run_name']} "
+                    f"checkpoint={reuse_s4_checkpoint_path}"
+                ),
+                echo=True,
+            )
+            _write_json(
+                {
+                    "warm_start_run_name": warm_run_cfg["run_name"],
+                    "warm_start_dir": str(warm_dirs["run_dir"]),
+                    "warm_start_best_checkpoint": (
+                        None if skip_disk_checkpoints else str(warm_start_artifacts.checkpoint_path)
+                    ),
+                    "aligned_best_checkpoint": str(reuse_s4_checkpoint_path),
+                    "reused_s4_checkpoint_path": str(reuse_s4_checkpoint_path),
+                    "reuse_s4_checkpoint_step_idx": checkpoint_payload.get("step_idx"),
+                    "reuse_s4_checkpoint_mode": "sampling_only",
+                    "disk_checkpoints_saved": bool(not skip_disk_checkpoints),
+                },
+                run_dirs["metrics_dir"] / "s4_alignment_summary.json",
+            )
+        else:
+            if evaluator is None:
+                evaluator = load_step5_evaluator(resolved, device=device)
+            rl_artifacts = train_s4_rl_alignment(
+                resolved=resolved,
+                run_cfg=run_cfg,
+                run_dirs=run_dirs,
+                warm_start=warm_start_artifacts,
+                prior=prior,
+                evaluator=evaluator,
+                device=device,
+                target_rows_df=target_rows_df,
+                skip_disk_checkpoints=skip_disk_checkpoints,
+                pruning_callback=pruning_callback,
+            )
+            tokenizer = rl_artifacts.tokenizer
+            diffusion_model = rl_artifacts.policy_model
+            _write_json(
+                {
+                    "warm_start_run_name": warm_run_cfg["run_name"],
+                    "warm_start_dir": str(warm_dirs["run_dir"]),
+                    "warm_start_best_checkpoint": (
+                        None if skip_disk_checkpoints else str(warm_start_artifacts.checkpoint_path)
+                    ),
+                    "aligned_best_checkpoint": (
+                        None if skip_disk_checkpoints else str(rl_artifacts.checkpoint_path)
+                    ),
+                    "disk_checkpoints_saved": bool(not skip_disk_checkpoints),
+                },
+                run_dirs["metrics_dir"] / "s4_alignment_summary.json",
+            )
+        s2_scaler = warm_start_artifacts.scaler
     else:
         tokenizer, diffusion_model, checkpoint_path = load_step1_diffusion(resolved, device=device)
         s0_raw_step1_baseline = str(run_cfg["run_name"]) == "S0_raw_unconditional"
