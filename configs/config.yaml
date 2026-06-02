@@ -289,11 +289,11 @@ chi_training:
     decode_constraint_cycle_backbone_template_cores_across_targets: false
     decode_constraint_enforce_class_match: true  # exact SMARTS class filter during constrained Step 2 valid-only acceptance
     decode_constraint_enforce_backbone_class_match: true  # require class motif on backbone (shortest path between * atoms) for backbone classes
-    decode_constraint_class_match_sampling_attempts_max: 24
+    decode_constraint_class_match_sampling_attempts_max: 48
     decode_constraint_class_match_sampling_attempts_max_overrides:
-      polyamide: 24
+      polyamide: 48
       polyether: 24
-      polyimide: 48
+      polyimide: 160
       polysulfone: 24
     decode_constraint_class_match_oversample_factor: 3.0
     decode_constraint_class_match_oversample_factor_overrides:
@@ -310,10 +310,10 @@ chi_training:
     decode_constraint_allow_partial_quota_return_overrides:
       polyamide: true
       polyimide: true
-    decode_constraint_partial_quota_min_fill_ratio: 0.95
+    decode_constraint_partial_quota_min_fill_ratio: 1.0
     decode_constraint_partial_quota_min_fill_ratio_overrides:
-      polyamide: 0.95
-      polyimide: 0.60
+      polyamide: 1.0
+      polyimide: 1.0
     decode_constraint_enforce_star_ok_acceptance: false
     decode_constraint_enforce_star_ok_acceptance_overrides:
       polyacrylate: true
@@ -324,6 +324,8 @@ chi_training:
       polysulfone: true
       polystyrene: true
     decode_constraint_reject_duplicate_canonical_acceptance: true
+    decode_constraint_reject_duplicate_canonical_acceptance_overrides:
+      polyimide: false
     decode_constraint_reject_duplicate_canonical_across_targets: false
     decode_constraint_reject_duplicate_canonical_across_targets_overrides:
       polyimide: true

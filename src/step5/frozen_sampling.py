@@ -785,8 +785,11 @@ def resolve_class_sampling_prior(
         default_value=bool(step5_cfg.get("decode_constraint_enforce_star_ok_acceptance", False)),
         cast=bool,
     )
-    reject_duplicate_canonical_acceptance = bool(
-        step5_cfg.get("decode_constraint_reject_duplicate_canonical_acceptance", True)
+    reject_duplicate_canonical_acceptance = _resolve_class_override(
+        step5_cfg.get("decode_constraint_reject_duplicate_canonical_acceptance_overrides", {}),
+        target_class=target_class,
+        default_value=bool(step5_cfg.get("decode_constraint_reject_duplicate_canonical_acceptance", True)),
+        cast=bool,
     )
     reject_sidechain_backbone_hybrids = _resolve_class_override(
         step5_cfg.get("decode_constraint_reject_sidechain_backbone_hybrid_overrides", {}),

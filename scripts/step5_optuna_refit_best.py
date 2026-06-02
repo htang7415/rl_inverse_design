@@ -124,27 +124,46 @@ def _apply_base_config_override(resolved, args):
         override.setdefault("sampling", {})["batch_size"] = int(args.sampling_batch_size)
 
     decode_override: Dict[str, object] = {}
+    target_class = str(args.c_target).strip() if args.c_target else ""
     if args.class_match_sampling_attempts_max is not None:
-        decode_override["decode_constraint_class_match_sampling_attempts_max"] = int(
-            args.class_match_sampling_attempts_max
-        )
+        value = int(args.class_match_sampling_attempts_max)
+        decode_override["decode_constraint_class_match_sampling_attempts_max"] = value
+        if target_class:
+            decode_override.setdefault("decode_constraint_class_match_sampling_attempts_max_overrides", {})[
+                target_class
+            ] = value
     if args.class_match_oversample_factor is not None:
-        decode_override["decode_constraint_class_match_oversample_factor"] = float(
-            args.class_match_oversample_factor
-        )
+        value = float(args.class_match_oversample_factor)
+        decode_override["decode_constraint_class_match_oversample_factor"] = value
+        if target_class:
+            decode_override.setdefault("decode_constraint_class_match_oversample_factor_overrides", {})[
+                target_class
+            ] = value
     if args.class_match_max_request_size is not None:
-        decode_override["decode_constraint_class_match_max_request_size"] = int(
-            args.class_match_max_request_size
-        )
+        value = int(args.class_match_max_request_size)
+        decode_override["decode_constraint_class_match_max_request_size"] = value
+        if target_class:
+            decode_override.setdefault("decode_constraint_class_match_max_request_size_overrides", {})[
+                target_class
+            ] = value
     if args.class_match_max_total_raw_samples is not None:
-        decode_override["decode_constraint_class_match_max_total_raw_samples"] = int(
-            args.class_match_max_total_raw_samples
-        )
+        value = int(args.class_match_max_total_raw_samples)
+        decode_override["decode_constraint_class_match_max_total_raw_samples"] = value
+        if target_class:
+            decode_override.setdefault("decode_constraint_class_match_max_total_raw_samples_overrides", {})[
+                target_class
+            ] = value
     if args.partial_quota_min_fill_ratio is not None:
+        value = float(args.partial_quota_min_fill_ratio)
         decode_override["decode_constraint_allow_partial_quota_return"] = True
-        decode_override["decode_constraint_partial_quota_min_fill_ratio"] = float(
-            args.partial_quota_min_fill_ratio
-        )
+        decode_override["decode_constraint_partial_quota_min_fill_ratio"] = value
+        if target_class:
+            decode_override.setdefault("decode_constraint_allow_partial_quota_return_overrides", {})[
+                target_class
+            ] = True
+            decode_override.setdefault("decode_constraint_partial_quota_min_fill_ratio_overrides", {})[
+                target_class
+            ] = value
     if decode_override:
         override.setdefault("chi_training", {})["step5_inverse_design"] = decode_override
 
