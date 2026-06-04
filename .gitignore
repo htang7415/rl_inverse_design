@@ -13,6 +13,7 @@ Data/
 *Data
 Generated_polymers
 ml_simulation_comparation
+select_dft_validation_candidates.py
 
 # 
 experiments*/
