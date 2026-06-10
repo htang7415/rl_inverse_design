@@ -1,27 +1,42 @@
-# Python
+# Python caches
 __pycache__/
-*.pyc
+*.py[cod]
 *.pyo
-results/
-results_small
-results_1
+.pytest_cache/
+
+# Local tool/cache directories
 .cache/
 .mplconfig/
-traditional_step4/results*/
-Bi_Diffusion_SMILES
+.codex/
+.claude/
+
+# Local data and generated result roots
 Data/
 *Data
-Generated_polymers
-ml_simulation_comparation
-select_dft_validation_candidates.py
-
-# 
+results/
+results_small/
+results_1/
+traditional_step4/results*/
+DiT_postprocess/
+rl_postprocess/
+logs/
 experiments*/
 Experiments*/
 
-*.md
+# Historical/local generated folders and scratch files
+Bi_Diffusion_SMILES/
+Generated_polymers/
+ml_simulation_comparation/
+select_dft_validation_candidates.py
 
-*.txt
+# Markdown docs
+*.md
+!/README.md
+
+# Shell wrappers/scripts
+*.sh
+
+# Model and analysis artifacts
 *.csv
 *.pkl
 *.pt
@@ -29,11 +44,22 @@ Experiments*/
 *.pdf
 *.svg
 *.eps
-*.tex
+*.ipynb
+*.pptx
+*.gz
+
+# Logs and scheduler output
 *.log
 *.err
 *.out
-*.ipynb
-*.pptx
-*.sh
-*.gz
+
+# LaTeX build byproducts
+*.aux
+*.bcf
+*.blg
+*.fdb_latexmk
+*.fls
+*.run.xml
+*.synctex.gz
+.texmf-var/
+.texmf-config/
